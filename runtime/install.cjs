@@ -30,6 +30,11 @@ function passwd(name) {
 }
 
 if (process.getuid() !== 0) throw new Error("must run as root");
+// Sandboxed steps run through run0 (systemd 256 or later): ubuntu-26.04 and
+// RHEL 10 have it, ubuntu-24.04 (systemd 255) does not.
+if (run("sh", ["-c", "command -v run0"], { check: false }).status !== 0) {
+  throw new Error("run0 not found: sandboxed steps need systemd 256 or later (e.g. runs-on: ubuntu-26.04)");
+}
 const runner = process.env.SUDO_USER;
 if (!runner || runner === "root") throw new Error("must be started with sudo by the runner user");
 const user = CONFIG.user;
@@ -69,6 +74,22 @@ for (const [dest, text] of [[EXEC, process.env.RUNNER_SANDBOX_EXEC_JS], [RUN, pr
 }
 for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results"]) {
   fs.mkdirSync(d, { recursive: true, mode: 0o755 });
+}
+
+// Nothing may start the sandbox user's processes outside a step, where the
+// wrapper can't stop them: no cron, no at, no lingering user manager (whose
+// polkit action, like every other, is denied to it below).
+for (const deny of ["/etc/cron.deny", "/etc/at.deny"]) {
+  const lines = fs.existsSync(deny) ? fs.readFileSync(deny, "utf8").split("\n") : [];
+  if (!lines.includes(user)) fs.appendFileSync(deny, `${user}\n`, { mode: 0o600 });
+}
+run("loginctl", ["disable-linger", user]);
+if (fs.existsSync("/etc/polkit-1")) {
+  fs.mkdirSync("/etc/polkit-1/rules.d", { recursive: true, mode: 0o755 });
+  fs.writeFileSync("/etc/polkit-1/rules.d/00-runner-sandbox.rules", `polkit.addRule(function(action, subject) {
+  if (subject.user == ${JSON.stringify(user)}) return polkit.Result.NO;
+});
+`, { mode: 0o644 });
 }
 
 // The last matching sudoers rule wins, and this file is read last.

@@ -11,7 +11,7 @@ gha.compile {
   on = { workflow_call = {}, workflow_dispatch = {} },
   permissions = { contents = "read" },
   jobs.sandbox = {
-    "runs-on" = "ubuntu-24.04",
+    "runs-on" = "ubuntu-26.04",
     "timeout-minutes" = 15,
     sandbox = {
       user = "runner-sandbox",
@@ -39,6 +39,15 @@ gha.compile {
           test "$(id -un)" = runner-sandbox
           test "$PWD" = /var/lib/runner-sandbox/work
           test -f LICENSE
+        "%,
+      },
+      {
+        name = "Runs in a login session of its own, not as if under sudo",
+        run = m%"
+          test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
+          loginctl show-session "$XDG_SESSION_ID" -p Name -p Class
+          test "$(loginctl show-session "$XDG_SESSION_ID" -p Name --value)" = runner-sandbox
+          if env | grep ^SUDO_; then echo "SUDO_* leaked into the sandbox"; exit 1; fi
         "%,
       },
       { name = "sudo is refused", id = "sudo", "continue-on-error" = true, run = "sudo -n true" },
@@ -93,15 +102,36 @@ gha.compile {
         run = m%"setsid sleep 600 </dev/null >/dev/null 2>&1 & echo "started $!""%,
       },
       {
+        name = "Leave a process behind and time out",
+        id = "timeout",
+        "timeout-minutes" = 1,
+        "continue-on-error" = true,
+        run = m%"
+          setsid sleep 600 </dev/null >/dev/null 2>&1 &
+          systemd-run --user --quiet sleep 601
+          sleep 300
+        "%,
+      },
+      {
+        name = "Cron, at and lingering are denied",
+        run = m%"
+          if echo "* * * * * sleep 602" | crontab - 2>/dev/null; then echo "installed a crontab"; exit 1; fi
+          if command -v at >/dev/null && echo "sleep 603" | at now 2>/dev/null; then echo "queued an at job"; exit 1; fi
+          if loginctl enable-linger 2>/dev/null; then echo "enabled lingering"; exit 1; fi
+        "%,
+      },
+      {
         name = "The escapes failed",
         env = {
           SYMLINK = "${{ steps.symlink.outcome }}",
           HEREDOC = "${{ steps.heredoc.outcome }}",
+          TIMEOUT = "${{ steps.timeout.outcome }}",
         },
         run = m%"
           test "$SYMLINK" = failure
           test "$HEREDOC" = failure
-          if pgrep -u runner-sandbox -x sleep; then echo "a process survived its step"; exit 1; fi
+          test "$TIMEOUT" = failure
+          if pgrep -u runner-sandbox -a sleep; then echo "a process survived its step"; exit 1; fi
           echo "all escapes failed"
         "%,
       },
