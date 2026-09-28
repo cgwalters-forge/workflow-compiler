@@ -1,8 +1,8 @@
 // Root side of a sandboxed step: runner-sandbox-exec pipes a request
 // ({id, script, env}) to this program through `sudo -n`, the one command the
 // runner user may still run as root once the job has entered the sandbox.
-// It runs the script as the sandbox user in a transient systemd service with
-// a fixed environment, then hands back what the step wrote to its
+// It runs the script as the sandbox user with run0, in a login session of
+// its own and with a fixed environment, then hands back what the step wrote to its
 // GITHUB_OUTPUT and GITHUB_STEP_SUMMARY. Nothing here trusts the request: its
 // fields are validated, and the files the sandbox wrote are read without
 // following symlinks.
@@ -16,6 +16,7 @@ const STEPS_DIR = "/run/runner-sandbox/steps";
 const RESULTS_DIR = "/run/runner-sandbox/results";
 const MAX_FILE = 1 << 20;
 const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
+const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
 // Variables the request may not set: the runner's credentials and anything
 // that changes how the sandbox's own programs start.
 const DENIED_ENV = /^(ACTIONS_|GITHUB_TOKEN$|GITHUB_ENV$|GITHUB_PATH$|GITHUB_OUTPUT$|GITHUB_STATE$|GITHUB_STEP_SUMMARY$|RUNNER_|LD_|BASH_ENV$|ENV$|NODE_OPTIONS$|PATH$|HOME$|USER$|LOGNAME$|SHELL$)/;
@@ -69,27 +70,42 @@ fs.chownSync(outDir, CONFIG.uid, CONFIG.gid);
 
 const vars = {
   ...env,
-  HOME: CONFIG.home, USER: user, LOGNAME: user, LANG: "C.UTF-8", PATH: SANDBOX_PATH,
+  LANG: "C.UTF-8", PATH: SANDBOX_PATH,
   GITHUB_OUTPUT: path.join(outDir, "output"),
   GITHUB_STEP_SUMMARY: path.join(outDir, "summary"),
 };
+// run0 starts the script as a transient service through its own PAM stack
+// (no pam_env), so pam_systemd gives it a logind session like an SSH login
+// gets: XDG_RUNTIME_DIR and the user's systemd manager, which rootless
+// podman needs. It sets HOME, USER, LOGNAME and SHELL for the sandbox user
+// itself. It also sets SUDO_USER and friends as sudo would, which tools
+// take to mean they run under sudo, and --setenv can't unset them, hence
+// the env -u. Unlike systemd-run --collect, run0 would leave a failed unit
+// behind for every step that fails, so collect those too.
 const argv = [
-  "--quiet", "--collect", "--wait", "--pipe", "--service-type=exec",
-  `--uid=${user}`, `--gid=${user}`, `--working-directory=${CONFIG.workdir}`,
+  "--pipe", "--no-ask-password", "--shell-prompt-prefix=", `--user=${user}`, `--chdir=${CONFIG.workdir}`,
+  "--property=CollectMode=inactive-or-failed",
   // The sandbox gets its own /tmp, so it can't leave files there for the
   // runner's later steps; the runner's home is hidden outright.
-  "-p", "PrivateTmp=yes", "-p", `InaccessiblePaths=-${CONFIG.runnerHome}`,
+  "--property=PrivateTmp=yes", `--property=InaccessiblePaths=-${CONFIG.runnerHome}`,
   ...Object.entries(vars).map(([k, v]) => `--setenv=${k}=${v}`),
-  "--", "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", path.join(stepDir, "script.sh"),
+  "--", "env", ...SUDO_VARS.flatMap((v) => ["-u", v]), "--",
+  "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", path.join(stepDir, "script.sh"),
 ];
-// systemd-run --pipe hands stdin to PID 1, which accepts a pipe but not
-// every file type, so give it an empty pipe rather than /dev/null.
-const r = spawnSync("systemd-run", argv, { stdio: ["pipe", "inherit", "inherit"], input: "" });
+// run0 hands stdio to PID 1 over D-Bus, which accepts pipes but not every
+// file type, so give it an empty pipe rather than /dev/null.
+const r = spawnSync("run0", argv, { stdio: ["pipe", "inherit", "inherit"], input: "" });
 const status = r.status ?? 125;
 
-// The unit is gone (--wait), so no sandbox process can change these now.
+// pam_systemd moved the step into a session scope, which outlives the
+// service when the step leaves a process behind, and the user's systemd
+// manager can run more. Stopping the user's slice ends all of them, and
+// systemctl waits until they are gone, so each step starts with no process
+// of the sandbox user left and none can touch the files read below.
+const stop = spawnSync("systemctl", ["stop", `user-${CONFIG.uid}.slice`], { stdio: ["ignore", "inherit", "inherit"] });
 let result;
 try {
+  if (stop.status !== 0) throw new Error(`could not stop the sandbox user's processes (${stop.error ?? `exit ${stop.status}`})`);
   result = { status, output: readSandboxFile(path.join(outDir, "output")), summary: readSandboxFile(path.join(outDir, "summary")) };
 } catch (e) {
   result = { status: 125, error: e.message };

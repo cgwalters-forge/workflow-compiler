@@ -29,6 +29,11 @@ function passwd(name) {
 }
 
 if (process.getuid() !== 0) throw new Error("must run as root");
+// Sandboxed steps run through run0 (systemd 256 or later): ubuntu-26.04 and
+// RHEL 10 have it, ubuntu-24.04 (systemd 255) does not.
+if (run("sh", ["-c", "command -v run0"], { check: false }).status !== 0) {
+  throw new Error("run0 not found: sandboxed steps need systemd 256 or later (e.g. runs-on: ubuntu-26.04)");
+}
 const runner = process.env.SUDO_USER;
 if (!runner || runner === "root") throw new Error("must be started with sudo by the runner user");
 const user = CONFIG.user;
