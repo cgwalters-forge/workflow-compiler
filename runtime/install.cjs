@@ -76,6 +76,22 @@ for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results"]) {
   fs.mkdirSync(d, { recursive: true, mode: 0o755 });
 }
 
+// Nothing may start the sandbox user's processes outside a step, where the
+// wrapper can't stop them: no cron, no at, no lingering user manager (whose
+// polkit action, like every other, is denied to it below).
+for (const deny of ["/etc/cron.deny", "/etc/at.deny"]) {
+  const lines = fs.existsSync(deny) ? fs.readFileSync(deny, "utf8").split("\n") : [];
+  if (!lines.includes(user)) fs.appendFileSync(deny, `${user}\n`, { mode: 0o600 });
+}
+run("loginctl", ["disable-linger", user]);
+if (fs.existsSync("/etc/polkit-1")) {
+  fs.mkdirSync("/etc/polkit-1/rules.d", { recursive: true, mode: 0o755 });
+  fs.writeFileSync("/etc/polkit-1/rules.d/00-runner-sandbox.rules", `polkit.addRule(function(action, subject) {
+  if (subject.user == ${JSON.stringify(user)}) return polkit.Result.NO;
+});
+`, { mode: 0o644 });
+}
+
 // The last matching sudoers rule wins, and this file is read last.
 let sudoers = `${user} ALL=(ALL:ALL) !ALL\n`;
 if (CONFIG.lockRunnerSudo) {

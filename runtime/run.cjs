@@ -60,7 +60,21 @@ for (const [k, v] of Object.entries(env)) {
   if (typeof v !== "string" || /[\0\n\r]/.test(v)) fail(`${k}: values must be single-line strings`);
 }
 
+// pam_systemd moves each step into a session scope, which outlives the
+// service when the step leaves a process behind, and the user's systemd
+// manager can run more. Stopping the user's slice ends all of them, and
+// systemctl waits until they are gone. It runs before each step too, for a
+// step whose run.cjs was killed (a timeout, a cancel) before it got to
+// stop its own; cron, at and lingering are denied to the sandbox user, so
+// nothing can start its processes outside a step.
+function stopSandboxProcesses() {
+  const r = spawnSync("systemctl", ["stop", `user-${CONFIG.uid}.slice`], { stdio: ["ignore", "inherit", "inherit"] });
+  return r.status === 0 ? null : `could not stop the sandbox user's processes (${r.error ?? `exit ${r.status}`})`;
+}
+
 const user = CONFIG.user;
+const stopError = stopSandboxProcesses();
+if (stopError) fail(stopError);
 const stepDir = path.join(STEPS_DIR, req.id);
 const outDir = path.join(stepDir, "out");
 fs.mkdirSync(stepDir, { mode: 0o755 }); // fails if the id was used before
@@ -97,15 +111,12 @@ const argv = [
 const r = spawnSync("run0", argv, { stdio: ["pipe", "inherit", "inherit"], input: "" });
 const status = r.status ?? 125;
 
-// pam_systemd moved the step into a session scope, which outlives the
-// service when the step leaves a process behind, and the user's systemd
-// manager can run more. Stopping the user's slice ends all of them, and
-// systemctl waits until they are gone, so each step starts with no process
-// of the sandbox user left and none can touch the files read below.
-const stop = spawnSync("systemctl", ["stop", `user-${CONFIG.uid}.slice`], { stdio: ["ignore", "inherit", "inherit"] });
+// Every process of the step is gone after this, so none can touch the
+// files read below.
+const stopAfter = stopSandboxProcesses();
 let result;
 try {
-  if (stop.status !== 0) throw new Error(`could not stop the sandbox user's processes (${stop.error ?? `exit ${stop.status}`})`);
+  if (stopAfter) throw new Error(stopAfter);
   result = { status, output: readSandboxFile(path.join(outDir, "output")), summary: readSandboxFile(path.join(outDir, "summary")) };
 } catch (e) {
   result = { status: 125, error: e.message };

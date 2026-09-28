@@ -128,15 +128,36 @@ gha.compile {
         run = m%"setsid sleep 600 </dev/null >/dev/null 2>&1 & echo "started $!""%,
       },
       {
+        name = "Leave a process behind and time out",
+        id = "timeout",
+        "timeout-minutes" = 1,
+        "continue-on-error" = true,
+        run = m%"
+          setsid sleep 600 </dev/null >/dev/null 2>&1 &
+          systemd-run --user --quiet sleep 601
+          sleep 300
+        "%,
+      },
+      {
+        name = "Cron, at and lingering are denied",
+        run = m%"
+          if echo "* * * * * sleep 602" | crontab - 2>/dev/null; then echo "installed a crontab"; exit 1; fi
+          if command -v at >/dev/null && echo "sleep 603" | at now 2>/dev/null; then echo "queued an at job"; exit 1; fi
+          if loginctl enable-linger 2>/dev/null; then echo "enabled lingering"; exit 1; fi
+        "%,
+      },
+      {
         name = "The escapes failed",
         env = {
           SYMLINK = "${{ steps.symlink.outcome }}",
           HEREDOC = "${{ steps.heredoc.outcome }}",
+          TIMEOUT = "${{ steps.timeout.outcome }}",
         },
         run = m%"
           test "$SYMLINK" = failure
           test "$HEREDOC" = failure
-          if pgrep -u runner-sandbox -x sleep; then echo "a process survived its step"; exit 1; fi
+          test "$TIMEOUT" = failure
+          if pgrep -u runner-sandbox -a sleep; then echo "a process survived its step"; exit 1; fi
           echo "all escapes failed"
         "%,
       },
