@@ -14,6 +14,7 @@ jobs:
         echo "installed by runner_steps, run by $(id -un)"
         EOF
         sudo chmod 0755 /usr/local/bin/hello-tool
+        echo RUNNER-SECRET-MARKER >"$HOME/runner-secret.txt"
         ln -s /etc/shadow shadow-link
         ln -s /etc shadow-dir
       shell: bash
@@ -555,6 +556,9 @@ jobs:
           // (through sudo) to run the script as the sandbox user. Afterwards it copies
           // the step's outputs and summary into the runner's own files, accepting only
           // plain name=value output lines.
+          //
+          // `runner-sandbox-exec --collect NAME PATH` has the root side copy PATH
+          // out of the sandbox for a generated upload step instead.
           "use strict";
           const fs = require("node:fs");
           const crypto = require("node:crypto");
@@ -574,15 +578,20 @@ jobs:
             process.exit(125);
           }
 
+          const collect = process.argv[2] === "--collect";
           const scriptPath = process.argv[2];
-          if (!scriptPath || process.argv.length !== 3) fail("usage: runner-sandbox-exec SCRIPT");
+          if (collect ? process.argv.length !== 5 : !scriptPath || process.argv.length !== 3) {
+            fail("usage: runner-sandbox-exec SCRIPT | --collect NAME PATH");
+          }
           const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
           const env = {};
           for (const name of [...CONTEXT_ENV, ...names]) {
             if (process.env[name] !== undefined) env[name] = process.env[name];
           }
           const id = crypto.randomBytes(16).toString("hex");
-          const request = JSON.stringify({ id, script: fs.readFileSync(scriptPath, "utf8"), env });
+          const request = JSON.stringify(collect
+            ? { id, collect: { name: process.argv[3], path: process.argv[4] } }
+            : { id, script: fs.readFileSync(scriptPath, "utf8"), env });
           // By absolute path: the step's own env: applies to this process.
           const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
           if (r.error) fail(`running ${RUN}: ${r.error.message}`);
@@ -609,6 +618,11 @@ jobs:
           // GITHUB_OUTPUT and GITHUB_STEP_SUMMARY. Nothing here trusts the request: its
           // fields are validated, and the files the sandbox wrote are read without
           // following symlinks.
+          //
+          // A request {id, collect: {name, path}} instead copies PATH from the
+          // sandbox's workspace to COLLECT_DIR/NAME, for a generated upload step:
+          // actions like upload-artifact run as runner and follow symlinks, so they
+          // must never read a path the sandbox controls.
           "use strict";
           const fs = require("node:fs");
           const path = require("node:path");
@@ -617,6 +631,7 @@ jobs:
           const CONFIG = JSON.parse(fs.readFileSync("/etc/runner-sandbox/config.json", "utf8"));
           const STEPS_DIR = "/run/runner-sandbox/steps";
           const RESULTS_DIR = "/run/runner-sandbox/results";
+          const COLLECT_DIR = "/run/runner-sandbox/collect";
           const MAX_FILE = 1 << 20;
           const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
           const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
@@ -648,6 +663,46 @@ jobs:
             }
           }
 
+          // Copies SRC to DEST as root:root, 0644 files in 0755 directories,
+          // refusing symlinks and special files anywhere below SRC.
+          function copyTree(src, dest) {
+            const st = fs.lstatSync(src);
+            if (st.isDirectory()) {
+              fs.mkdirSync(dest, { mode: 0o755 });
+              for (const entry of fs.readdirSync(src).sort()) copyTree(path.join(src, entry), path.join(dest, entry));
+            } else if (st.isFile()) {
+              fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+            } else {
+              throw new Error(`${path.relative(CONFIG.workdir, src)} is a symlink or special file`);
+            }
+          }
+
+          // Handles a collect request; the sandbox user has no process left, so
+          // nothing changes the tree while it is copied.
+          function collect({ name, path: rel }) {
+            if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid upload name ${JSON.stringify(name)}`);
+            if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
+              throw new Error(`invalid upload path ${JSON.stringify(rel)}`);
+            }
+            const src = path.join(CONFIG.workdir, rel);
+            let real;
+            try {
+              real = fs.realpathSync(src);
+            } catch (e) {
+              throw new Error(`${rel}: ${e.code}`);
+            }
+            if (real !== src) throw new Error(`${rel} goes through a symlink`);
+            const dest = path.join(COLLECT_DIR, name);
+            fs.rmSync(dest, { recursive: true, force: true });
+            fs.mkdirSync(dest, { mode: 0o755 });
+            try {
+              copyTree(src, path.join(dest, path.basename(src)));
+            } catch (e) {
+              fs.rmSync(dest, { recursive: true, force: true });
+              throw e;
+            }
+          }
+
           let req;
           try {
             req = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -655,7 +710,7 @@ jobs:
             fail(`invalid request: ${e.message}`);
           }
           if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-          if (typeof req.script !== "string") fail("missing script");
+          if (typeof req.script !== "string" && typeof req.collect !== "object") fail("missing script");
           const env = req.env ?? {};
           for (const [k, v] of Object.entries(env)) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
@@ -678,6 +733,16 @@ jobs:
           const user = CONFIG.user;
           const stopError = stopSandboxProcesses();
           if (stopError) fail(stopError);
+          if (req.collect) {
+            let result = { status: 0, output: "", summary: "" };
+            try {
+              collect(req.collect);
+            } catch (e) {
+              result = { status: 1, error: `upload: ${e.message}` };
+            }
+            fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+            process.exit(result.status);
+          }
           const stepDir = path.join(STEPS_DIR, req.id);
           const outDir = path.join(stepDir, "out");
           fs.mkdirSync(stepDir, { mode: 0o755 }); // fails if the id was used before
@@ -808,7 +873,7 @@ jobs:
           fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
           fs.chmodSync(dest, 0o755);
         }
-        for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results"]) {
+        for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/collect"]) {
           fs.mkdirSync(d, { recursive: true, mode: 0o755 });
         }
 
@@ -966,12 +1031,86 @@ jobs:
         if pgrep -u runner-sandbox -a sleep; then echo "a process survived its step"; exit 1; fi
         echo "all escapes failed"
       shell: /usr/local/bin/runner-sandbox-exec {0}
-    - if: always()
-      name: Upload what the sandbox wrote
+    - name: Point uploads at the runner's secrets
+      run: |-
+        ln -s /proc/self/environ leak-environ
+        ln -s /home/runner/runner-secret.txt leak-runner
+        ln -s /home/runner leak-via
+        mkdir leak-dir
+        echo harmless >leak-dir/ok
+        ln -s /proc/self/environ leak-dir/environ
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - continue-on-error: true
+      id: collect-leak-environ
+      name: Collect leak-environ for upload (generated)
+      run: /usr/local/bin/runner-sandbox-exec --collect leak-environ leak-environ
+      shell: bash
+    - if: '!cancelled() && steps.collect-leak-environ.outcome == ''success'''
+      name: Upload leak-environ (generated)
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
+        if-no-files-found: error
+        name: leak-environ
+        path: /run/runner-sandbox/collect/leak-environ
+    - continue-on-error: true
+      id: collect-leak-runner
+      name: Collect leak-runner for upload (generated)
+      run: /usr/local/bin/runner-sandbox-exec --collect leak-runner leak-runner
+      shell: bash
+    - if: '!cancelled() && steps.collect-leak-runner.outcome == ''success'''
+      name: Upload leak-runner (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-runner
+        path: /run/runner-sandbox/collect/leak-runner
+    - continue-on-error: true
+      id: collect-leak-via
+      name: Collect leak-via/runner-secret.txt for upload (generated)
+      run: /usr/local/bin/runner-sandbox-exec --collect leak-via leak-via/runner-secret.txt
+      shell: bash
+    - if: '!cancelled() && steps.collect-leak-via.outcome == ''success'''
+      name: Upload leak-via (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-via
+        path: /run/runner-sandbox/collect/leak-via
+    - continue-on-error: true
+      id: collect-leak-dir
+      name: Collect leak-dir for upload (generated)
+      run: /usr/local/bin/runner-sandbox-exec --collect leak-dir leak-dir
+      shell: bash
+    - if: '!cancelled() && steps.collect-leak-dir.outcome == ''success'''
+      name: Upload leak-dir (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-dir
+        path: /run/runner-sandbox/collect/leak-dir
+    - env:
+        DIR: ${{ steps.collect-leak-dir.outcome }}
+        ENVIRON: ${{ steps.collect-leak-environ.outcome }}
+        RUNNER: ${{ steps.collect-leak-runner.outcome }}
+        RUNNER_SANDBOX_ENV: DIR,ENVIRON,RUNNER,VIA
+        VIA: ${{ steps.collect-leak-via.outcome }}
+      name: Every upload through a symlink was refused
+      run: |-
+        echo "environ=$ENVIRON runner=$RUNNER via=$VIA dir=$DIR"
+        test "$ENVIRON $RUNNER $VIA $DIR" = "failure failure failure failure"
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - id: collect-sandbox-test
+      if: always()
+      name: Collect hello.log for upload (generated)
+      run: /usr/local/bin/runner-sandbox-exec --collect sandbox-test hello.log
+      shell: bash
+    - if: '!cancelled() && steps.collect-sandbox-test.outcome == ''success'''
+      name: Upload sandbox-test (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
         name: sandbox-test
-        path: /var/lib/runner-sandbox/work/hello.log
+        path: /run/runner-sandbox/collect/sandbox-test
     timeout-minutes: 15
 name: Sandbox test
 on:

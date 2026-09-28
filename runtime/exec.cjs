@@ -6,6 +6,9 @@
 // (through sudo) to run the script as the sandbox user. Afterwards it copies
 // the step's outputs and summary into the runner's own files, accepting only
 // plain name=value output lines.
+//
+// `runner-sandbox-exec --collect NAME PATH` has the root side copy PATH
+// out of the sandbox for a generated upload step instead.
 "use strict";
 const fs = require("node:fs");
 const crypto = require("node:crypto");
@@ -25,15 +28,20 @@ function fail(message) {
   process.exit(125);
 }
 
+const collect = process.argv[2] === "--collect";
 const scriptPath = process.argv[2];
-if (!scriptPath || process.argv.length !== 3) fail("usage: runner-sandbox-exec SCRIPT");
+if (collect ? process.argv.length !== 5 : !scriptPath || process.argv.length !== 3) {
+  fail("usage: runner-sandbox-exec SCRIPT | --collect NAME PATH");
+}
 const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
 const env = {};
 for (const name of [...CONTEXT_ENV, ...names]) {
   if (process.env[name] !== undefined) env[name] = process.env[name];
 }
 const id = crypto.randomBytes(16).toString("hex");
-const request = JSON.stringify({ id, script: fs.readFileSync(scriptPath, "utf8"), env });
+const request = JSON.stringify(collect
+  ? { id, collect: { name: process.argv[3], path: process.argv[4] } }
+  : { id, script: fs.readFileSync(scriptPath, "utf8"), env });
 // By absolute path: the step's own env: applies to this process.
 const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
 if (r.error) fail(`running ${RUN}: ${r.error.message}`);

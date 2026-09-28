@@ -72,7 +72,7 @@ for (const [dest, text] of [[EXEC, process.env.RUNNER_SANDBOX_EXEC_JS], [RUN, pr
   fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
   fs.chmodSync(dest, 0o755);
 }
-for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results"]) {
+for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/collect"]) {
   fs.mkdirSync(d, { recursive: true, mode: 0o755 });
 }
 

@@ -60,10 +60,25 @@ jobs:
   # The compiled workflows themselves, on real hosted runners.
   sandbox-test:
     uses: ./.github/workflows/sandbox-test.lock.yml
+  # sandbox-test tried to upload the runner's secrets through symlinks.
+  sandbox-test-artifacts:
+    needs: sandbox-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+      - name: No artifact holds the runtime token or the runner's secret
+        run: |
+          find artifacts -ls
+          # A single artifact is downloaded without a directory of its own.
+          find artifacts -name hello.log | grep -q .
+          if find artifacts -name 'leak-*' | grep .; then echo "a leak- artifact was uploaded"; exit 1; fi
+          if grep -rlE 'ACTIONS_RUNTIME_TOKEN|RUNNER-SECRET-MARKER' artifacts; then echo "an artifact leaked a secret"; exit 1; fi
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test]
+    needs: [lint, compile, sandbox-test, sandbox-test-artifacts]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
