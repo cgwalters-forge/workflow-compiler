@@ -3,7 +3,8 @@
 # `runner_steps` run as the stock `runner` user, with its sudo, and set the
 # machine up: packages, checkout, network. The compiler then adds a step
 # that secures the host (runtime/secure-host.cjs) and one that enters the
-# sandbox (runtime/install.cjs). Every step in `steps` runs
+# sandbox (runtime/install.cjs). A `share` runner step publishes a file to
+# the sandbox read-only, under SHARE_DIR. Every step in `steps` runs
 # after that as the unprivileged sandbox user: `run:` steps get the sandbox
 # wrapper as their shell, and `uses:` steps are limited to the job's
 # `sandbox.allowed_actions`, pinned by commit.
@@ -14,6 +15,8 @@
 # `env:`) is an error rather than silently passed through.
 let EXEC = "/usr/local/bin/runner-sandbox-exec" in
 let USER_RE = "^[a-z_][a-z0-9_-]{0,30}$" in
+# Where `share` runner steps publish (runtime/share.cjs has it too).
+let SHARE_DIR = "/etc/agent-share" in
 
 let validator = fun pred msg =>
   std.contract.from_validator (fun v => if pred v then 'Ok else 'Error { message = msg v })
@@ -62,6 +65,41 @@ let RunnerStep = std.contract.Sequence [
   OneOfRunUses,
 ] in
 
+# A `share` runner step publishes a file or directory tree from the
+# runner's side as a root-owned, world-readable copy at
+# SHARE_DIR/<name> (runtime/share.cjs): the sandbox can read it but not
+# change it, so it's where the privileged phase hands the sandbox its
+# instructions (an agent's prompt and skills, a config).
+let ShareName = validator
+  (fun s => std.string.is_match "^[A-Za-z0-9][A-Za-z0-9._-]*$" s)
+  (fun s => "share name `%{s}` must be a single path component ([A-Za-z0-9][A-Za-z0-9._-]*)")
+in
+
+# Everything the sandbox can read, so no credentials either.
+let ShareNoCredentials = validator
+  (fun s => !(std.string.is_match "\\$\\{\\{[^}]*(secrets\\.|github\\.token)" s))
+  (fun s => "a share is readable by the sandbox, so it cannot reference secrets or github.token")
+in
+
+let ShareStep = {
+  name | String | optional,
+  id | String | optional,
+  "if" | String | optional,
+  "continue-on-error" | Bool | optional,
+  share | std.contract.Sequence [
+    {
+      name | ShareName,
+      # A file or directory in the workspace; symlinks are refused.
+      path | ShareNoCredentials | optional,
+      # Or the file's content.
+      content | ShareNoCredentials | optional,
+    },
+    validator
+      (fun sh => std.record.has_field "path" sh != std.record.has_field "content" sh)
+      (fun sh => "share `%{sh.name}` needs exactly one of `path` or `content`"),
+  ],
+} in
+
 # No `shell` (the compiler sets it) and no `working-directory` (the wrapper
 # owns the working directory): both are errors here.
 let SandboxStep = fun allowed => std.contract.Sequence [
@@ -98,7 +136,8 @@ let Job = {
   needs | Dyn | optional,
   permissions | { _ : String } | optional,
   sandbox | Sandbox | default = {},
-  runner_steps | Array RunnerStep | default = [],
+  # RunnerStep or ShareStep, checked in compile_job.
+  runner_steps | Array Dyn | default = [],
   steps | Array Dyn,
 } in
 
@@ -142,6 +181,23 @@ let secure_host_step = {
   run = import "../runtime/secure-host.cjs" as 'Text,
 } in
 
+let share_step = fun step =>
+  let share = step.share in
+  let source = if std.record.has_field "path" share then { SHARE_PATH = share.path } else { SHARE_CONTENT = share.content } in
+  step
+  |> std.record.remove "share"
+  |> (fun s => if std.record.has_field "name" s then s else std.record.insert "name" "Share %{share.name} as %{SHARE_DIR}/%{share.name} (generated)" s)
+  # Settings go through env, where Actions expands expressions into data, not
+  # into the script's source.
+  |> std.record.insert "env" ({ SHARE_NAME = share.name } & source)
+  |> std.record.insert "shell" "sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}"
+  |> std.record.insert "run" (import "../runtime/share.cjs" as 'Text)
+in
+
+let runner_step = fun step =>
+  if std.record.has_field "share" step then share_step (step | ShareStep) else step | RunnerStep
+in
+
 let sandbox_step = fun step =>
   if std.record.has_field "run" step then
     let env = if std.record.has_field "env" step then step.env else {} in
@@ -164,10 +220,11 @@ let compile_job = fun job =>
   let steps = std.array.map (fun s => s | SandboxStep sandbox.allowed_actions) job.steps in
   job
   |> std.record.filter (fun name _v => !(std.array.elem name COMPILER_FIELDS))
-  |> std.record.insert "steps" (job.runner_steps @ [secure_host_step, install_step sandbox] @ std.array.map sandbox_step steps)
+  |> std.record.insert "steps" (std.array.map runner_step job.runner_steps @ [secure_host_step, install_step sandbox] @ std.array.map sandbox_step steps)
 in
 
 {
+  share_dir = SHARE_DIR,
   compile = fun source =>
     let wf = source | Workflow in
     wf
