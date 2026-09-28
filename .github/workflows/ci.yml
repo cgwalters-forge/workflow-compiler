@@ -65,10 +65,12 @@ jobs:
   # The compiled workflows themselves, on real hosted runners.
   sandbox-test:
     uses: ./.github/workflows/sandbox-test.lock.yml
+  agent-review:
+    uses: ./.github/workflows/agent-review.lock.yml
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test]
+    needs: [lint, compile, sandbox-test, agent-review]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
