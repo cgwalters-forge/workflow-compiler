@@ -19,7 +19,7 @@ const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
 const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
 // Variables the request may not set: the runner's credentials and anything
 // that changes how the sandbox's own programs start.
-const DENIED_ENV = /^(ACTIONS_|GITHUB_TOKEN$|GITHUB_ENV$|GITHUB_PATH$|GITHUB_OUTPUT$|GITHUB_STATE$|GITHUB_STEP_SUMMARY$|RUNNER_|LD_|BASH_ENV$|ENV$|NODE_OPTIONS$|PATH$|HOME$|USER$|LOGNAME$|SHELL$)/;
+const DENIED_ENV = /^(ACTIONS_|GITHUB_TOKEN$|GITHUB_ENV$|GITHUB_PATH$|GITHUB_OUTPUT$|GITHUB_STATE$|GITHUB_STEP_SUMMARY$|RUNNER_|LD_|BASH_ENV$|ENV$|NODE_|PATH$|HOME$|USER$|LOGNAME$|SHELL$)/;
 
 function fail(message) {
   console.error(`runner-sandbox-run: ${message}`);

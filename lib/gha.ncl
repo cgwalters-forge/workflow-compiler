@@ -28,12 +28,42 @@ let Pinned = validator
   (fun s => "`%{s}` must be pinned by full commit SHA (owner/repo@<40 hex>)")
 in
 
+# Whether S has an expression naming a secret or the job's token.
+# Expressions are case-insensitive and have many spellings (secrets.X,
+# secrets['X'], toJSON(secrets), format('{0}', secrets.X), github.token,
+# github['token'], toJSON(github)), and a string literal inside one can
+# hold `}}`, so rather than parse them this looks at all of S after each
+# `${{`. It's a lint against mistakes, not a boundary: a value runner_steps
+# put in GITHUB_ENV, for one, still reaches the sandbox through `env.X`.
+let CREDENTIALS_RE = "(?i)\\bsecrets\\b|\\bgithub\\s*(\\[|[,)}]|\\.\\s*token\\b)" in
+let mentions_credentials = fun s =>
+  std.array.any
+    (fun expr => std.string.is_match CREDENTIALS_RE expr)
+    (std.array.drop_first (std.string.split "${{" s))
+in
+
 # Sandboxed steps never see the job's credentials, so they may not name them
 # either: an expression expanding a secret or the token into a script or an
 # env value would hand it to the sandbox.
 let NoCredentials = validator
-  (fun s => !(std.string.is_match "\\$\\{\\{[^}]*(secrets\\.|github\\.token)" s))
-  (fun s => "sandboxed steps cannot reference secrets or github.token; pass data through runner_steps outputs instead")
+  (fun s => std.is_string s && !(mentions_credentials s))
+  (fun s =>
+    if std.is_string s then
+      "sandboxed steps cannot reference secrets or github.token; pass data through runner_steps outputs instead"
+    else
+      "values in a sandboxed step's `with` and `env` must be strings (quote numbers and booleans)")
+in
+
+# A step's `env` applies to the runner side of the wrapper too, which runs
+# as runner under node before anything is validated, so names that change
+# how a program starts or where it finds others are refused here, along
+# with the ones runner-sandbox-run refuses anyway.
+let DENIED_ENV_RE = "^(ACTIONS_|RUNNER_|GITHUB_(TOKEN|ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)$|LD_|NODE_|(BASH_ENV|ENV|PATH|HOME|USER|LOGNAME|SHELL)$)" in
+let SafeEnvNames = validator
+  (fun env => std.array.all (fun n => !(std.string.is_match DENIED_ENV_RE n)) (std.record.fields env))
+  (fun env =>
+    let bad = std.array.filter (fun n => std.string.is_match DENIED_ENV_RE n) (std.record.fields env) in
+    "`%{std.array.first bad}` cannot be set in a sandboxed step's env: it would reach the runner side of the step wrapper, or is the sandbox's own")
 in
 
 let OneOfRunUses = validator
@@ -110,7 +140,7 @@ let SandboxStep = fun allowed => std.contract.Sequence [
     run | NoCredentials | optional,
     uses | Pinned | optional,
     with | { _ : NoCredentials } | optional,
-    env | { _ : NoCredentials } | optional,
+    env | { _ : NoCredentials } | SafeEnvNames | optional,
     "continue-on-error" | Bool | optional,
     "timeout-minutes" | Number | optional,
   },
@@ -201,7 +231,7 @@ in
 let sandbox_step = fun step =>
   if std.record.has_field "run" step then
     let env = if std.record.has_field "env" step then step.env else {} in
-    let env_names = std.array.filter (fun n => n != "RUNNER_SANDBOX_ENV") (std.record.fields env) in
+    let env_names = std.record.fields env in
     let step = step |> std.record.insert "shell" "%{EXEC} {0}" in
     if env_names == [] then
       step

@@ -12,6 +12,7 @@ const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 
 const RUN = "/usr/local/libexec/runner-sandbox-run";
+const SUDO = "/usr/bin/sudo";
 const RESULTS_DIR = "/run/runner-sandbox/results";
 const CONTEXT_ENV = [
   "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_EVENT_NAME", "GITHUB_JOB", "GITHUB_REF", "GITHUB_REF_NAME",
@@ -33,7 +34,8 @@ for (const name of [...CONTEXT_ENV, ...names]) {
 }
 const id = crypto.randomBytes(16).toString("hex");
 const request = JSON.stringify({ id, script: fs.readFileSync(scriptPath, "utf8"), env });
-const r = spawnSync("sudo", ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
+// By absolute path: the step's own env: applies to this process.
+const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
 if (r.error) fail(`running ${RUN}: ${r.error.message}`);
 
 let result;

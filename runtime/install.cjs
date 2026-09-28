@@ -8,6 +8,7 @@
 // root away from the runner user, whose only remaining sudo rule is the
 // wrapper. From here on, the job's run steps execute as the sandbox user.
 const fs = require("node:fs");
+const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const CONFIG_DIR = "/etc/runner-sandbox";
@@ -53,10 +54,22 @@ fs.chmodSync(runnerHome, 0o700);
 
 fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o755 });
 fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, runnerHome }), { mode: 0o644 });
+// runner-sandbox-run runs as root under this node, through the one sudo
+// rule runner keeps, so the binary and every directory above it must be
+// root's alone: a runner-owned node, as in a tool cache, would give runner
+// root.
+const node = fs.realpathSync(process.execPath);
+for (let p = node; ; p = path.dirname(p)) {
+  const st = fs.statSync(p);
+  if (st.uid !== 0 || st.mode & 0o002 || (st.mode & 0o020 && st.gid !== 0)) {
+    throw new Error(`${p} must be owned by root and writable only by root: the step wrapper runs as root under ${node}`);
+  }
+  if (p === "/") break;
+}
 fs.mkdirSync("/usr/local/libexec", { recursive: true });
 for (const [dest, text] of [[EXEC, process.env.RUNNER_SANDBOX_EXEC_JS], [RUN, process.env.RUNNER_SANDBOX_RUN_JS]]) {
   if (!text) throw new Error(`nothing to install at ${dest}`);
-  fs.writeFileSync(dest, `#!${process.execPath}\n${text}`, { mode: 0o755 });
+  fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
   fs.chmodSync(dest, 0o755);
 }
 for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results"]) {
