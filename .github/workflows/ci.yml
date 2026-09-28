@@ -1,4 +1,5 @@
-# The one job named ci is what the main branch ruleset requires.
+# The one job named ci is what the main branch ruleset requires; it passes
+# only when every other job does.
 name: ci
 
 on:
@@ -14,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,3 +29,39 @@ jobs:
         with:
           args: --offline --include-fragments --no-progress "**/*.md"
           fail: true
+
+  # Every lock file matches its source, and every source in tests/reject/
+  # fails to compile with the message it expects.
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NICKEL_VERSION: 1.18.0
+      NICKEL_SHA256: 9cba4dd65ae9915ec61f73033aafcff307a377665a83fd8f530df086763318cb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nickel
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nickel" "https://github.com/nickel-lang/nickel/releases/download/$NICKEL_VERSION/nickel-x86_64-linux"
+          echo "$NICKEL_SHA256  $RUNNER_TEMP/nickel" | sha256sum -c
+          chmod +x "$RUNNER_TEMP/nickel"
+      - name: Check lock files and rejections
+        run: NICKEL="$RUNNER_TEMP/nickel" node compile.mjs --check
+
+  # The compiled workflows themselves, on real hosted runners.
+  sandbox-test:
+    uses: ./.github/workflows/sandbox-test.lock.yml
+
+  ci:
+    if: always()
+    needs: [lint, compile, sandbox-test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do test "$r" = success; done
