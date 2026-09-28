@@ -80,10 +80,12 @@ jobs:
           find artifacts -name hello.log | grep -q .
           if find artifacts -name 'leak-*' | grep .; then echo "a leak- artifact was uploaded"; exit 1; fi
           if grep -rlE 'ACTIONS_RUNTIME_TOKEN|RUNNER-SECRET-MARKER' artifacts; then echo "an artifact leaked a secret"; exit 1; fi
+  agent-review:
+    uses: ./.github/workflows/agent-review.lock.yml
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test, sandbox-test-artifacts]
+    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
