@@ -1,0 +1,3 @@
+# actionlint predates the ubuntu-26.04 hosted runner.
+self-hosted-runner:
+  labels: [ubuntu-26.04]
