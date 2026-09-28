@@ -130,6 +130,34 @@ let ShareStep = {
   ],
 } in
 
+# An `upload` step in `steps` uploads a file or directory from the
+# sandbox's workspace as an artifact. Allowlisted actions run as runner
+# and follow symlinks, so upload-artifact pointed at the workspace would
+# upload whatever the sandbox links there (/proc/self/environ holds the
+# job's runtime token). The compiler emits instead a step that has the
+# wrapper's root side copy the path, refusing symlinks, to a root-owned
+# directory (runtime/run.cjs), then upload-artifact on that copy.
+let UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in # v7.0.1
+let COLLECT_DIR = "/run/runner-sandbox/collect" in
+let UploadStep = {
+  name | String | optional,
+  # The collecting step's id (default `collect-<upload.name>`): its outcome
+  # says whether the path could be uploaded.
+  id | String | optional,
+  "if" | String | optional,
+  "continue-on-error" | Bool | optional,
+  upload | {
+    name | validator
+      (fun s => std.string.is_match "^[A-Za-z0-9_-]+$" s)
+      (fun s => "upload name `%{s}` must match [A-Za-z0-9_-]+"),
+    # Relative to the sandbox's workspace.
+    path | validator
+      (fun s => std.string.is_match "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$" s && !(std.string.is_match "(^|/)\\.\\.?(/|$)" s))
+      (fun s => "upload path `%{s}` must be relative to the workspace, without `.` or `..`"),
+    "retention-days" | Number | optional,
+  },
+} in
+
 # No `shell` (the compiler sets it) and no `working-directory` (the wrapper
 # owns the working directory): both are errors here.
 let SandboxStep = fun allowed => std.contract.Sequence [
@@ -154,7 +182,8 @@ let Sandbox = {
   # its only sudo rule left is the wrapper.
   lock_runner_sudo | Bool | default = true,
   # Actions (owner/repo[/path], without @ref) allowed in `steps`. They run as
-  # the runner user, not in the sandbox, so keep this short.
+  # the runner user, not in the sandbox, so keep this short, and never point
+  # one at a path the sandbox can write: use an `upload` step for artifacts.
   allowed_actions | Array String | default = [],
 } in
 
@@ -243,14 +272,46 @@ let sandbox_step = fun step =>
     step
 in
 
+let upload_steps = fun step =>
+  let up = step.upload in
+  let id = if std.record.has_field "id" step then step.id else "collect-%{up.name}" in
+  let collect_step =
+    step
+    |> std.record.remove "upload"
+    |> std.record.filter (fun name _v => name != "id" && name != "name")
+    |> std.record.insert "id" id
+    |> std.record.insert "name" (if std.record.has_field "name" step then step.name else "Collect %{up.path} for upload (generated)")
+    |> std.record.insert "shell" "bash"
+    |> std.record.insert "run" "%{EXEC} --collect %{up.name} %{up.path}"
+  in
+  [
+    collect_step,
+    {
+      name = "Upload %{up.name} (generated)",
+      "if" = "!cancelled() && steps.%{id}.outcome == 'success'",
+      uses = UPLOAD_ARTIFACT,
+      with = { name = up.name, path = "%{COLLECT_DIR}/%{up.name}", if-no-files-found = "error" }
+        & (if std.record.has_field "retention-days" up then { retention-days = up."retention-days" } else {}),
+    },
+  ]
+in
+
 let COMPILER_FIELDS = ["sandbox", "runner_steps", "steps"] in
 
 let compile_job = fun job =>
   let sandbox = job.sandbox in
-  let steps = std.array.map (fun s => s | SandboxStep sandbox.allowed_actions) job.steps in
+  let steps =
+    std.array.flat_map
+      (fun s =>
+        if std.record.has_field "upload" s then
+          upload_steps (s | UploadStep)
+        else
+          [sandbox_step (s | SandboxStep sandbox.allowed_actions)])
+      job.steps
+  in
   job
   |> std.record.filter (fun name _v => !(std.array.elem name COMPILER_FIELDS))
-  |> std.record.insert "steps" (std.array.map runner_step job.runner_steps @ [secure_host_step, install_step sandbox] @ std.array.map sandbox_step steps)
+  |> std.record.insert "steps" (std.array.map runner_step job.runner_steps @ [secure_host_step, install_step sandbox] @ steps)
 in
 
 {

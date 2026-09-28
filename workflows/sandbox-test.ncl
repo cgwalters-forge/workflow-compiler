@@ -4,7 +4,6 @@
 # .github/workflows/sandbox-test.lock.yml.
 let gha = import "../lib/gha.ncl" in
 let checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in # v7.0.1
-let upload_artifact = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in # v7.0.1
 
 gha.compile {
   name = "Sandbox test",
@@ -13,10 +12,7 @@ gha.compile {
   jobs.sandbox = {
     "runs-on" = "ubuntu-26.04",
     "timeout-minutes" = 15,
-    sandbox = {
-      user = "runner-sandbox",
-      allowed_actions = ["actions/upload-artifact"],
-    },
+    sandbox.user = "runner-sandbox",
     runner_steps = [
       { uses = checkout, with = { persist-credentials = false } },
       {
@@ -28,6 +24,7 @@ gha.compile {
           echo "installed by runner_steps, run by $(id -un)"
           EOF
           sudo chmod 0755 /usr/local/bin/hello-tool
+          echo RUNNER-SECRET-MARKER >"$HOME/runner-secret.txt"
           ln -s /etc/shadow shadow-link
           ln -s /etc shadow-dir
         "%,
@@ -167,12 +164,37 @@ gha.compile {
           echo "all escapes failed"
         "%,
       },
+      # Uploads: ci.yml checks that no artifact holds the job's runtime
+      # token or the runner's secret.
       {
-        name = "Upload what the sandbox wrote",
-        "if" = "always()",
-        uses = upload_artifact,
-        with = { name = "sandbox-test", path = "/var/lib/runner-sandbox/work/hello.log" },
+        name = "Point uploads at the runner's secrets",
+        run = m%"
+          ln -s /proc/self/environ leak-environ
+          ln -s /home/runner/runner-secret.txt leak-runner
+          ln -s /home/runner leak-via
+          mkdir leak-dir
+          echo harmless >leak-dir/ok
+          ln -s /proc/self/environ leak-dir/environ
+        "%,
       },
+      { "continue-on-error" = true, upload = { name = "leak-environ", path = "leak-environ" } },
+      { "continue-on-error" = true, upload = { name = "leak-runner", path = "leak-runner" } },
+      { "continue-on-error" = true, upload = { name = "leak-via", path = "leak-via/runner-secret.txt" } },
+      { "continue-on-error" = true, upload = { name = "leak-dir", path = "leak-dir" } },
+      {
+        name = "Every upload through a symlink was refused",
+        env = {
+          ENVIRON = "${{ steps.collect-leak-environ.outcome }}",
+          RUNNER = "${{ steps.collect-leak-runner.outcome }}",
+          VIA = "${{ steps.collect-leak-via.outcome }}",
+          DIR = "${{ steps.collect-leak-dir.outcome }}",
+        },
+        run = m%"
+          echo "environ=$ENVIRON runner=$RUNNER via=$VIA dir=$DIR"
+          test "$ENVIRON $RUNNER $VIA $DIR" = "failure failure failure failure"
+        "%,
+      },
+      { "if" = "always()", upload = { name = "sandbox-test", path = "hello.log" } },
     ],
   },
 }
