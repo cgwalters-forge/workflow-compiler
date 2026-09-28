@@ -66,7 +66,12 @@ try {
     fs.writeFileSync(tmp, process.env.SHARE_CONTENT, { mode: 0o644, flag: "wx" });
     fs.chmodSync(tmp, 0o644);
   } else {
-    copyTree(path.resolve(process.env.SHARE_PATH), tmp);
+    // copyTree refuses symlinks below the path, and this those in it: a
+    // symlinked directory `a` in a checkout would otherwise make `a/b`
+    // any file on the machine.
+    const src = path.resolve(fs.realpathSync(process.cwd()), process.env.SHARE_PATH);
+    if (fs.realpathSync(src) !== src) fail(`${process.env.SHARE_PATH} goes through a symlink; refusing to share it`);
+    copyTree(src, tmp);
   }
   // Owned by root however it was made.
   fs.chownSync(tmp, 0, 0);

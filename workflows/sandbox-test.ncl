@@ -29,6 +29,7 @@ gha.compile {
           EOF
           sudo chmod 0755 /usr/local/bin/hello-tool
           ln -s /etc/shadow shadow-link
+          ln -s /etc shadow-dir
         "%,
       },
       # Shares, read-only to the sandbox: content, a file, a directory.
@@ -37,6 +38,7 @@ gha.compile {
       { share = { name = "reject-tests", path = "tests/reject" } },
       # A symlink in the checkout must not publish its target.
       { id = "share-symlink", "continue-on-error" = true, share = { name = "shadow", path = "shadow-link" } },
+      { id = "share-symlink-dir", "continue-on-error" = true, share = { name = "shadow2", path = "shadow-dir/shadow" } },
     ],
     steps = [
       {
@@ -79,7 +81,10 @@ gha.compile {
       },
       {
         name = "Read the shares, and fail to change them",
-        env = { SYMLINK_SHARE = "${{ steps.share-symlink.outcome }}" },
+        env = {
+          SYMLINK_SHARE = "${{ steps.share-symlink.outcome }}",
+          SYMLINK_DIR_SHARE = "${{ steps.share-symlink-dir.outcome }}",
+        },
         run = m%"
           cd %{gha.share_dir}
           ls -lR
@@ -88,6 +93,7 @@ gha.compile {
           test -f reject-tests/shell-override.ncl
           test "$(stat -c '%U:%G %a' . greeting LICENSE reject-tests reject-tests/shell-override.ncl)" = "$(printf 'root:root %s\n' 755 644 644 755 644)"
           test "$SYMLINK_SHARE" = failure && test ! -e shadow
+          test "$SYMLINK_DIR_SHARE" = failure && test ! -e shadow2
           for f in greeting LICENSE reject-tests/shell-override.ncl; do
             if { echo pwned >>"$f"; } 2>/dev/null; then echo "wrote $f"; exit 1; fi
           done

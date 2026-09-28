@@ -107,7 +107,7 @@ in
 
 # Everything the sandbox can read, so no credentials either.
 let ShareNoCredentials = validator
-  (fun s => !(std.string.is_match "\\$\\{\\{[^}]*(secrets\\.|github\\.token)" s))
+  (fun s => !(mentions_credentials s))
   (fun s => "a share is readable by the sandbox, so it cannot reference secrets or github.token")
 in
 
