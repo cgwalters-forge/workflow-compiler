@@ -1,0 +1,24 @@
+[package]
+name = "workflow-compiler"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Compile nickel workflow sources into sandboxed GitHub Actions lock files"
+publish = false
+
+[[bin]]
+name = "wfc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Outside nickel's 1.0 stability promise, so pinned exactly; bump it
+# deliberately and regenerate the lock files. 0.19.0 is the core of
+# nickel-lang-cli 1.18.0.
+nickel-lang-core = { version = "=0.19.0", default-features = false }
+
+# nickel's evaluator is slow unoptimized, and `cargo test` and
+# `cargo run -- compile` evaluate every source.
+[profile.dev.package."*"]
+opt-level = 2
