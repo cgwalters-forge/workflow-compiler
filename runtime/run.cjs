@@ -6,6 +6,11 @@
 // GITHUB_OUTPUT and GITHUB_STEP_SUMMARY. Nothing here trusts the request: its
 // fields are validated, and the files the sandbox wrote are read without
 // following symlinks.
+//
+// A request {id, collect: {name, path}} instead copies PATH from the
+// sandbox's workspace to COLLECT_DIR/NAME, for a generated upload step:
+// actions like upload-artifact run as runner and follow symlinks, so they
+// must never read a path the sandbox controls.
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
@@ -14,6 +19,7 @@ const { spawnSync } = require("node:child_process");
 const CONFIG = JSON.parse(fs.readFileSync("/etc/runner-sandbox/config.json", "utf8"));
 const STEPS_DIR = "/run/runner-sandbox/steps";
 const RESULTS_DIR = "/run/runner-sandbox/results";
+const COLLECT_DIR = "/run/runner-sandbox/collect";
 const MAX_FILE = 1 << 20;
 const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
 const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
@@ -45,6 +51,46 @@ function readSandboxFile(file) {
   }
 }
 
+// Copies SRC to DEST as root:root, 0644 files in 0755 directories,
+// refusing symlinks and special files anywhere below SRC.
+function copyTree(src, dest) {
+  const st = fs.lstatSync(src);
+  if (st.isDirectory()) {
+    fs.mkdirSync(dest, { mode: 0o755 });
+    for (const entry of fs.readdirSync(src).sort()) copyTree(path.join(src, entry), path.join(dest, entry));
+  } else if (st.isFile()) {
+    fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+  } else {
+    throw new Error(`${path.relative(CONFIG.workdir, src)} is a symlink or special file`);
+  }
+}
+
+// Handles a collect request; the sandbox user has no process left, so
+// nothing changes the tree while it is copied.
+function collect({ name, path: rel }) {
+  if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid upload name ${JSON.stringify(name)}`);
+  if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
+    throw new Error(`invalid upload path ${JSON.stringify(rel)}`);
+  }
+  const src = path.join(CONFIG.workdir, rel);
+  let real;
+  try {
+    real = fs.realpathSync(src);
+  } catch (e) {
+    throw new Error(`${rel}: ${e.code}`);
+  }
+  if (real !== src) throw new Error(`${rel} goes through a symlink`);
+  const dest = path.join(COLLECT_DIR, name);
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { mode: 0o755 });
+  try {
+    copyTree(src, path.join(dest, path.basename(src)));
+  } catch (e) {
+    fs.rmSync(dest, { recursive: true, force: true });
+    throw e;
+  }
+}
+
 let req;
 try {
   req = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -52,7 +98,7 @@ try {
   fail(`invalid request: ${e.message}`);
 }
 if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-if (typeof req.script !== "string") fail("missing script");
+if (typeof req.script !== "string" && typeof req.collect !== "object") fail("missing script");
 const env = req.env ?? {};
 for (const [k, v] of Object.entries(env)) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
@@ -75,6 +121,16 @@ function stopSandboxProcesses() {
 const user = CONFIG.user;
 const stopError = stopSandboxProcesses();
 if (stopError) fail(stopError);
+if (req.collect) {
+  let result = { status: 0, output: "", summary: "" };
+  try {
+    collect(req.collect);
+  } catch (e) {
+    result = { status: 1, error: `upload: ${e.message}` };
+  }
+  fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+  process.exit(result.status);
+}
 const stepDir = path.join(STEPS_DIR, req.id);
 const outDir = path.join(stepDir, "out");
 fs.mkdirSync(stepDir, { mode: 0o755 }); // fails if the id was used before

@@ -80,7 +80,12 @@ jobs:
             fs.writeFileSync(tmp, process.env.SHARE_CONTENT, { mode: 0o644, flag: "wx" });
             fs.chmodSync(tmp, 0o644);
           } else {
-            copyTree(path.resolve(process.env.SHARE_PATH), tmp);
+            // copyTree refuses symlinks below the path, and this those in it: a
+            // symlinked directory `a` in a checkout would otherwise make `a/b`
+            // any file on the machine.
+            const src = path.resolve(fs.realpathSync(process.cwd()), process.env.SHARE_PATH);
+            if (fs.realpathSync(src) !== src) fail(`${process.env.SHARE_PATH} goes through a symlink; refusing to share it`);
+            copyTree(src, tmp);
           }
           // Owned by root however it was made.
           fs.chownSync(tmp, 0, 0);
@@ -214,12 +219,16 @@ jobs:
           // (through sudo) to run the script as the sandbox user. Afterwards it copies
           // the step's outputs and summary into the runner's own files, accepting only
           // plain name=value output lines.
+          //
+          // `runner-sandbox-exec --collect NAME PATH` has the root side copy PATH
+          // out of the sandbox for a generated upload step instead.
           "use strict";
           const fs = require("node:fs");
           const crypto = require("node:crypto");
           const { spawnSync } = require("node:child_process");
 
           const RUN = "/usr/local/libexec/runner-sandbox-run";
+          const SUDO = "/usr/bin/sudo";
           const RESULTS_DIR = "/run/runner-sandbox/results";
           const CONTEXT_ENV = [
             "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_EVENT_NAME", "GITHUB_JOB", "GITHUB_REF", "GITHUB_REF_NAME",
@@ -232,16 +241,22 @@ jobs:
             process.exit(125);
           }
 
+          const collect = process.argv[2] === "--collect";
           const scriptPath = process.argv[2];
-          if (!scriptPath || process.argv.length !== 3) fail("usage: runner-sandbox-exec SCRIPT");
+          if (collect ? process.argv.length !== 5 : !scriptPath || process.argv.length !== 3) {
+            fail("usage: runner-sandbox-exec SCRIPT | --collect NAME PATH");
+          }
           const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
           const env = {};
           for (const name of [...CONTEXT_ENV, ...names]) {
             if (process.env[name] !== undefined) env[name] = process.env[name];
           }
           const id = crypto.randomBytes(16).toString("hex");
-          const request = JSON.stringify({ id, script: fs.readFileSync(scriptPath, "utf8"), env });
-          const r = spawnSync("sudo", ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
+          const request = JSON.stringify(collect
+            ? { id, collect: { name: process.argv[3], path: process.argv[4] } }
+            : { id, script: fs.readFileSync(scriptPath, "utf8"), env });
+          // By absolute path: the step's own env: applies to this process.
+          const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
           if (r.error) fail(`running ${RUN}: ${r.error.message}`);
 
           let result;
@@ -266,6 +281,11 @@ jobs:
           // GITHUB_OUTPUT and GITHUB_STEP_SUMMARY. Nothing here trusts the request: its
           // fields are validated, and the files the sandbox wrote are read without
           // following symlinks.
+          //
+          // A request {id, collect: {name, path}} instead copies PATH from the
+          // sandbox's workspace to COLLECT_DIR/NAME, for a generated upload step:
+          // actions like upload-artifact run as runner and follow symlinks, so they
+          // must never read a path the sandbox controls.
           "use strict";
           const fs = require("node:fs");
           const path = require("node:path");
@@ -274,12 +294,13 @@ jobs:
           const CONFIG = JSON.parse(fs.readFileSync("/etc/runner-sandbox/config.json", "utf8"));
           const STEPS_DIR = "/run/runner-sandbox/steps";
           const RESULTS_DIR = "/run/runner-sandbox/results";
+          const COLLECT_DIR = "/run/runner-sandbox/collect";
           const MAX_FILE = 1 << 20;
           const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
           const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
           // Variables the request may not set: the runner's credentials and anything
           // that changes how the sandbox's own programs start.
-          const DENIED_ENV = /^(ACTIONS_|GITHUB_TOKEN$|GITHUB_ENV$|GITHUB_PATH$|GITHUB_OUTPUT$|GITHUB_STATE$|GITHUB_STEP_SUMMARY$|RUNNER_|LD_|BASH_ENV$|ENV$|NODE_OPTIONS$|PATH$|HOME$|USER$|LOGNAME$|SHELL$)/;
+          const DENIED_ENV = /^(ACTIONS_|GITHUB_TOKEN$|GITHUB_ENV$|GITHUB_PATH$|GITHUB_OUTPUT$|GITHUB_STATE$|GITHUB_STEP_SUMMARY$|RUNNER_|LD_|BASH_ENV$|ENV$|NODE_|PATH$|HOME$|USER$|LOGNAME$|SHELL$)/;
 
           function fail(message) {
             console.error(`runner-sandbox-run: ${message}`);
@@ -305,6 +326,46 @@ jobs:
             }
           }
 
+          // Copies SRC to DEST as root:root, 0644 files in 0755 directories,
+          // refusing symlinks and special files anywhere below SRC.
+          function copyTree(src, dest) {
+            const st = fs.lstatSync(src);
+            if (st.isDirectory()) {
+              fs.mkdirSync(dest, { mode: 0o755 });
+              for (const entry of fs.readdirSync(src).sort()) copyTree(path.join(src, entry), path.join(dest, entry));
+            } else if (st.isFile()) {
+              fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+            } else {
+              throw new Error(`${path.relative(CONFIG.workdir, src)} is a symlink or special file`);
+            }
+          }
+
+          // Handles a collect request; the sandbox user has no process left, so
+          // nothing changes the tree while it is copied.
+          function collect({ name, path: rel }) {
+            if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid upload name ${JSON.stringify(name)}`);
+            if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
+              throw new Error(`invalid upload path ${JSON.stringify(rel)}`);
+            }
+            const src = path.join(CONFIG.workdir, rel);
+            let real;
+            try {
+              real = fs.realpathSync(src);
+            } catch (e) {
+              throw new Error(`${rel}: ${e.code}`);
+            }
+            if (real !== src) throw new Error(`${rel} goes through a symlink`);
+            const dest = path.join(COLLECT_DIR, name);
+            fs.rmSync(dest, { recursive: true, force: true });
+            fs.mkdirSync(dest, { mode: 0o755 });
+            try {
+              copyTree(src, path.join(dest, path.basename(src)));
+            } catch (e) {
+              fs.rmSync(dest, { recursive: true, force: true });
+              throw e;
+            }
+          }
+
           let req;
           try {
             req = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -312,7 +373,7 @@ jobs:
             fail(`invalid request: ${e.message}`);
           }
           if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-          if (typeof req.script !== "string") fail("missing script");
+          if (typeof req.script !== "string" && typeof req.collect !== "object") fail("missing script");
           const env = req.env ?? {};
           for (const [k, v] of Object.entries(env)) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
@@ -320,7 +381,31 @@ jobs:
             if (typeof v !== "string" || /[\0\n\r]/.test(v)) fail(`${k}: values must be single-line strings`);
           }
 
+          // pam_systemd moves each step into a session scope, which outlives the
+          // service when the step leaves a process behind, and the user's systemd
+          // manager can run more. Stopping the user's slice ends all of them, and
+          // systemctl waits until they are gone. It runs before each step too, for a
+          // step whose run.cjs was killed (a timeout, a cancel) before it got to
+          // stop its own; cron, at and lingering are denied to the sandbox user, so
+          // nothing can start its processes outside a step.
+          function stopSandboxProcesses() {
+            const r = spawnSync("systemctl", ["stop", `user-${CONFIG.uid}.slice`], { stdio: ["ignore", "inherit", "inherit"] });
+            return r.status === 0 ? null : `could not stop the sandbox user's processes (${r.error ?? `exit ${r.status}`})`;
+          }
+
           const user = CONFIG.user;
+          const stopError = stopSandboxProcesses();
+          if (stopError) fail(stopError);
+          if (req.collect) {
+            let result = { status: 0, output: "", summary: "" };
+            try {
+              collect(req.collect);
+            } catch (e) {
+              result = { status: 1, error: `upload: ${e.message}` };
+            }
+            fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+            process.exit(result.status);
+          }
           const stepDir = path.join(STEPS_DIR, req.id);
           const outDir = path.join(stepDir, "out");
           fs.mkdirSync(stepDir, { mode: 0o755 }); // fails if the id was used before
@@ -357,15 +442,12 @@ jobs:
           const r = spawnSync("run0", argv, { stdio: ["pipe", "inherit", "inherit"], input: "" });
           const status = r.status ?? 125;
 
-          // pam_systemd moved the step into a session scope, which outlives the
-          // service when the step leaves a process behind, and the user's systemd
-          // manager can run more. Stopping the user's slice ends all of them, and
-          // systemctl waits until they are gone, so each step starts with no process
-          // of the sandbox user left and none can touch the files read below.
-          const stop = spawnSync("systemctl", ["stop", `user-${CONFIG.uid}.slice`], { stdio: ["ignore", "inherit", "inherit"] });
+          // Every process of the step is gone after this, so none can touch the
+          // files read below.
+          const stopAfter = stopSandboxProcesses();
           let result;
           try {
-            if (stop.status !== 0) throw new Error(`could not stop the sandbox user's processes (${stop.error ?? `exit ${stop.status}`})`);
+            if (stopAfter) throw new Error(stopAfter);
             result = { status, output: readSandboxFile(path.join(outDir, "output")), summary: readSandboxFile(path.join(outDir, "summary")) };
           } catch (e) {
             result = { status: 125, error: e.message };
@@ -390,6 +472,7 @@ jobs:
         // root away from the runner user, whose only remaining sudo rule is the
         // wrapper. From here on, the job's run steps execute as the sandbox user.
         const fs = require("node:fs");
+        const path = require("node:path");
         const { spawnSync } = require("node:child_process");
 
         const CONFIG_DIR = "/etc/runner-sandbox";
@@ -435,14 +518,42 @@ jobs:
 
         fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o755 });
         fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, runnerHome }), { mode: 0o644 });
+        // runner-sandbox-run runs as root under this node, through the one sudo
+        // rule runner keeps, so the binary and every directory above it must be
+        // root's alone: a runner-owned node, as in a tool cache, would give runner
+        // root.
+        const node = fs.realpathSync(process.execPath);
+        for (let p = node; ; p = path.dirname(p)) {
+          const st = fs.statSync(p);
+          if (st.uid !== 0 || st.mode & 0o002 || (st.mode & 0o020 && st.gid !== 0)) {
+            throw new Error(`${p} must be owned by root and writable only by root: the step wrapper runs as root under ${node}`);
+          }
+          if (p === "/") break;
+        }
         fs.mkdirSync("/usr/local/libexec", { recursive: true });
         for (const [dest, text] of [[EXEC, process.env.RUNNER_SANDBOX_EXEC_JS], [RUN, process.env.RUNNER_SANDBOX_RUN_JS]]) {
           if (!text) throw new Error(`nothing to install at ${dest}`);
-          fs.writeFileSync(dest, `#!${process.execPath}\n${text}`, { mode: 0o755 });
+          fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
           fs.chmodSync(dest, 0o755);
         }
-        for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results"]) {
+        for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/collect"]) {
           fs.mkdirSync(d, { recursive: true, mode: 0o755 });
+        }
+
+        // Nothing may start the sandbox user's processes outside a step, where the
+        // wrapper can't stop them: no cron, no at, no lingering user manager (whose
+        // polkit action, like every other, is denied to it below).
+        for (const deny of ["/etc/cron.deny", "/etc/at.deny"]) {
+          const lines = fs.existsSync(deny) ? fs.readFileSync(deny, "utf8").split("\n") : [];
+          if (!lines.includes(user)) fs.appendFileSync(deny, `${user}\n`, { mode: 0o600 });
+        }
+        run("loginctl", ["disable-linger", user]);
+        if (fs.existsSync("/etc/polkit-1")) {
+          fs.mkdirSync("/etc/polkit-1/rules.d", { recursive: true, mode: 0o755 });
+          fs.writeFileSync("/etc/polkit-1/rules.d/00-runner-sandbox.rules", `polkit.addRule(function(action, subject) {
+          if (subject.user == ${JSON.stringify(user)}) return polkit.Result.NO;
+        });
+        `, { mode: 0o644 });
         }
 
         // The last matching sudoers rule wins, and this file is read last.
@@ -476,12 +587,18 @@ jobs:
       name: Run the agent
       run: /usr/local/bin/agent-stub "$PROMPT"
       shell: /usr/local/bin/runner-sandbox-exec {0}
-    - if: always()
-      name: Upload what the agent wrote
+    - id: collect-agent-output
+      if: always()
+      name: Collect review.md for upload (generated)
+      run: /usr/local/bin/runner-sandbox-exec --collect agent-output review.md
+      shell: bash
+    - if: '!cancelled() && steps.collect-agent-output.outcome == ''success'''
+      name: Upload agent-output (generated)
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
+        if-no-files-found: error
         name: agent-output
-        path: /var/lib/runner-sandbox/work/review.md
+        path: /run/runner-sandbox/collect/agent-output
     timeout-minutes: 30
 name: Agent review
 on:

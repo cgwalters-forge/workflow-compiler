@@ -1,0 +1,11 @@
+name: scratch
+on:
+  push:
+    branches: [scratch/wip]
+permissions:
+  contents: read
+jobs:
+  agent-review:
+    uses: ./.github/workflows/agent-review.lock.yml
+  sandbox-test:
+    uses: ./.github/workflows/sandbox-test.lock.yml

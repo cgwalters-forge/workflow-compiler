@@ -19,7 +19,6 @@
 # prompt, tries a few escapes, and writes a stub review.
 let gha = import "gha.ncl" in
 let checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in # v7.0.1
-let upload_artifact = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in # v7.0.1
 let AGENT = "/usr/local/bin/agent-stub" in
 
 let InShare =
@@ -45,7 +44,6 @@ fun args =>
   {
     "runs-on" = a."runs-on",
     "timeout-minutes" = a."timeout-minutes",
-    sandbox.allowed_actions = ["actions/upload-artifact"],
     runner_steps = [
       { uses = checkout, with = { persist-credentials = false } },
       { share = { name = a.skills.name, path = a.skills.path } },
@@ -66,11 +64,6 @@ fun args =>
         env = { PROMPT = a.prompt },
         run = m%"%{AGENT} "$PROMPT""%,
       },
-      {
-        name = "Upload what the agent wrote",
-        "if" = "always()",
-        uses = upload_artifact,
-        with = { name = "agent-output", path = "/var/lib/runner-sandbox/work/review.md" },
-      },
+      { "if" = "always()", upload = { name = "agent-output", path = "review.md" } },
     ],
   }
