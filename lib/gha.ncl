@@ -1,8 +1,9 @@
 # A GitHub Actions workflow in which every job has two phases.
 #
 # `runner_steps` run as the stock `runner` user, with its sudo, and set the
-# machine up: packages, checkout, network. The compiler then adds one step
-# that enters the sandbox (runtime/install.cjs). Every step in `steps` runs
+# machine up: packages, checkout, network. The compiler then adds a step
+# that secures the host (runtime/secure-host.cjs) and one that enters the
+# sandbox (runtime/install.cjs). Every step in `steps` runs
 # after that as the unprivileged sandbox user: `run:` steps get the sandbox
 # wrapper as their shell, and `uses:` steps are limited to the job's
 # `sandbox.allowed_actions`, pinned by commit.
@@ -131,6 +132,16 @@ let install_step = fun sandbox =>
   }
 in
 
+# Runs before the sandbox is entered, as root: closes what the runner
+# image leaves open to local users other than runner.
+# TODO: `uses = "cgwalters-forge/actions/secure-host-setup@<sha>"` once
+# that action exists, in place of this inline copy of it.
+let secure_host_step = {
+  name = "Secure the host (generated)",
+  shell = "sudo node {0}",
+  run = import "../runtime/secure-host.cjs" as 'Text,
+} in
+
 let sandbox_step = fun step =>
   if std.record.has_field "run" step then
     let env = if std.record.has_field "env" step then step.env else {} in
@@ -153,7 +164,7 @@ let compile_job = fun job =>
   let steps = std.array.map (fun s => s | SandboxStep sandbox.allowed_actions) job.steps in
   job
   |> std.record.filter (fun name _v => !(std.array.elem name COMPILER_FIELDS))
-  |> std.record.insert "steps" (job.runner_steps @ [install_step sandbox] @ std.array.map sandbox_step steps)
+  |> std.record.insert "steps" (job.runner_steps @ [secure_host_step, install_step sandbox] @ std.array.map sandbox_step steps)
 in
 
 {
