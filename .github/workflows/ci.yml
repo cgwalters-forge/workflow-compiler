@@ -75,6 +75,8 @@ jobs:
           find artifacts -name hello.log | grep -q .
           if find artifacts -name 'leak-*' | grep .; then echo "a leak- artifact was uploaded"; exit 1; fi
           if grep -rlE 'ACTIONS_RUNTIME_TOKEN|RUNNER-SECRET-MARKER' artifacts; then echo "an artifact leaked a secret"; exit 1; fi
+  agent-review:
+    uses: ./.github/workflows/agent-review.lock.yml
 
   # Skipped when the run is cancelled: concurrency cancels a run that a
   # newer one for the same ref supersedes (a stacked pull request's base
@@ -83,7 +85,7 @@ jobs:
   # as passed, so a run cancelled by hand needs a rerun before merging.
   ci:
     if: ${{ !cancelled() }}
-    needs: [lint, compile, sandbox-test, sandbox-test-artifacts]
+    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
