@@ -236,6 +236,14 @@ must pass `bash -n` and, when it is installed (as on the hosted runners
 ci uses), shellcheck, and must hold no `${{ }}` expression, which Actions
 would expand into the script's code; values go in the step's `env:`.
 
+`ci` also runs [zizmor](https://docs.zizmor.sh/) on every workflow, lock
+files included, the way gh-aw vendors it: its release image pinned by
+digest, offline, failing on findings of medium severity or worse, with
+the reviewed exceptions in `.github/zizmor.yml`. It covers what a
+workflow's YAML shows (template injection, unpinned or mismatched `uses:`,
+excessive permissions, persisted credentials, cache poisoning, dangerous
+triggers) but parses no shell, so scripts are left to `check`'s own lint.
+
 wfc reads and writes the repository only through a directory fd for its
 root (cap-std), and reads only what a compile needs (`READABLE` in
 `src/repo.rs`: the compiler's library and runtime, the sources, the tests
@@ -342,6 +350,7 @@ the task compiler that will produce this compiler's input):
 - [#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6) ubuntu-24.04, which has no `run0` (P2)
 - [#46](https://github.com/cgwalters-forge/workflow-compiler/issues/46) `fetch-actions.cjs` as a shared action (P2)
 - [#48](https://github.com/cgwalters-forge/workflow-compiler/issues/48) recompiling the lock files on Renovate branches (P2)
+- [#49](https://github.com/cgwalters-forge/workflow-compiler/issues/49) literal action defaults, which zizmor flags as obfuscation (P2)
 - [#9](https://github.com/cgwalters-forge/workflow-compiler/issues/9) replacing the runner's last sudo rule (P2)
 - [#10](https://github.com/cgwalters-forge/workflow-compiler/issues/10) blocking the cloud metadata service for the sandbox (P2)
 - [#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18) a size cap on staged outputs (P2)

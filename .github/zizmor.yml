@@ -1,0 +1,9 @@
+# zizmor's configuration; ci.yml's zizmor job runs it. Each exception
+# says why it was accepted.
+rules:
+  dangerous-triggers:
+    ignore:
+      # pull_request_target by design: it runs the default branch's code
+      # with contents: read and no secrets, and reads the pull request's
+      # tree only as data (R14 in docs/requirements.md).
+      - trusted-check.yml

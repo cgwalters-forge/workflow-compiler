@@ -62,6 +62,20 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint"
 
+  # zizmor, the GitHub Actions static analyzer, on every workflow, the
+  # lock files included, as gh-aw vendors it: a release image pinned by
+  # digest, offline (no token), failing on medium findings or worse.
+  # .github/zizmor.yml has the reviewed exceptions.
+  zizmor:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker://ghcr.io/zizmorcore/zizmor:1.30.1@sha256:a2eb396d886c053073405c7a980f2139ba2248ec172243cfa3841e57196e8101
+        with:
+          args: --offline --no-progress --min-severity medium .github/workflows
+
   # The compiled workflows themselves, on real hosted runners.
   sandbox-test:
     uses: ./.github/workflows/sandbox-test.lock.yml
@@ -136,7 +150,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review, agent-review-artifacts, actions-test]
+    needs: [lint, compile, zizmor, sandbox-test, sandbox-test-artifacts, agent-review, agent-review-artifacts, actions-test]
     runs-on: ubuntu-26.04
     steps:
       - name: All jobs passed
