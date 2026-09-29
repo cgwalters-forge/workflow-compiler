@@ -48,7 +48,11 @@ The compiler turns each job into:
 1. its `runner_steps`, as written. A `share` step publishes a file or
    directory as a root-owned, world-readable copy at
    `/etc/agent-share/<name>`: the channel from the privileged phase to the
-   sandbox, which the sandbox can read but not change.
+   sandbox, which the sandbox can read but not change. It compiles to the
+   `sandbox-share` action from
+   [cgwalters-forge/actions](https://github.com/cgwalters-forge/actions),
+   where the compiler's generated steps move from `runtime/`, used at the
+   commit `SHARED_ACTIONS` in `lib/gha.ncl` pins.
 2. a generated step that secures the host (`runtime/secure-host.cjs`;
    to be replaced by `cgwalters-forge/actions/secure-host-setup`, see [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5)).
 3. a generated step that enters the sandbox (`runtime/install.cjs`): it
@@ -283,6 +287,8 @@ the task compiler that will produce this compiler's input):
 - [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36) `agent_run` with real inference through praxis run tokens (P1)
 - [#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4) agent-run as a compiler macro or a composite action (P1)
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
+- [#45](https://github.com/cgwalters-forge/workflow-compiler/issues/45) the enter step's runtime as a shared `sandbox-enter` action (P1)
+- [#47](https://github.com/cgwalters-forge/workflow-compiler/issues/47) repinning `SHARED_ACTIONS` once cgwalters-forge/actions#7 merges (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20) caches saved from sandbox output and restored in `runner_steps` (P1)
@@ -291,9 +297,9 @@ the task compiler that will produce this compiler's input):
 - [#14](https://github.com/cgwalters-forge/workflow-compiler/issues/14) prompts from a trusted ref for PR-triggered agents (P2)
 - [#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2) post-steps of `runner_steps` actions (P2)
 - [#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6) ubuntu-24.04, which has no `run0` (P2)
+- [#46](https://github.com/cgwalters-forge/workflow-compiler/issues/46) `fetch-actions.cjs` as a shared action (P2)
 - [#9](https://github.com/cgwalters-forge/workflow-compiler/issues/9) replacing the runner's last sudo rule (P2)
 - [#10](https://github.com/cgwalters-forge/workflow-compiler/issues/10) blocking the cloud metadata service for the sandbox (P2)
-- [#11](https://github.com/cgwalters-forge/workflow-compiler/issues/11) embedding `share.cjs` once per job (P2)
 - [#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18) a size cap on staged outputs (P2)
 - [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21) checking the repository settings the guarantee depends on (P2)
 - [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22) restricting the sandbox's network egress (P2)
