@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// A change to the compiler, for trusted-check.
 // Compiles workflows/*.ncl into .github/workflows/*.lock.yml.
 //
 //   node compile.mjs          write the lock files, fetching the metadata
