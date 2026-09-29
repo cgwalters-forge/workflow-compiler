@@ -183,21 +183,26 @@ fn check_loaded(vm: &VmContext, ours: &HashSet<FileId>, source: &str) -> Result<
     Ok(())
 }
 
-/// Evaluates `source` and every file it imports, read through `repo`, and
-/// exports it in `format`, as `nickel export` does. Errors carry nickel's
-/// own report.
-fn export(repo: &Repo, source: &str, format: ExportFormat) -> Result<String> {
-    let (cache, main, ours) = load(repo, source)?;
+/// Evaluates `main`, whose name in reports is `name`, and exports it in
+/// `format`, as `nickel export` does. `ours` are the files `cache` was
+/// given. Errors carry nickel's own report.
+fn evaluate(
+    cache: CacheHub,
+    main: FileId,
+    ours: &HashSet<FileId>,
+    name: &str,
+    format: ExportFormat,
+) -> Result<String> {
     let mut vm = VmContext::new(cache, std::io::sink(), NullReporter {});
     let value: Result<NickelValue, Error> = vm.prepare_eval(main).and_then(|prepared| {
         VirtualMachine::new(&mut vm)
             .eval_full_for_export_closure(prepared.into())
             .map_err(Error::from)
     });
-    check_loaded(&vm, &ours, source)?;
+    check_loaded(&vm, ours, name)?;
     let value = value.map_err(|error| {
         anyhow!(
-            "{source} does not compile:\n{}",
+            "{name} does not compile:\n{}",
             report(&vm.import_resolver, error)
         )
     })?;
@@ -206,22 +211,44 @@ fn export(repo: &Repo, source: &str, format: ExportFormat) -> Result<String> {
         .map_err(|error| {
             let error = error.with_pos_table(vm.pos_table.clone());
             anyhow!(
-                "{source} can't be exported as {format}:\n{}",
+                "{name} can't be exported as {format}:\n{}",
                 report(&vm.import_resolver, error)
             )
         })
 }
 
-/// Evaluates the nickel file `source` (relative to the root) and exports
-/// it as YAML, as `nickel export --format yaml` does.
-pub fn export_yaml(repo: &Repo, source: &str) -> Result<String> {
+/// Runs `f` on a thread with a stack of [`STACK_SIZE`].
+fn on_big_stack<T: Send>(f: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("nickel".into())
             .stack_size(STACK_SIZE)
-            .spawn_scoped(scope, || export(repo, source, ExportFormat::Yaml))
+            .spawn_scoped(scope, f)
             .context("starting the evaluation thread")?
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
+}
+
+/// Evaluates the nickel file `source` (relative to the root) and exports
+/// it as YAML, as `nickel export --format yaml` does.
+pub fn export_yaml(repo: &Repo, source: &str) -> Result<String> {
+    on_big_stack(|| {
+        let (cache, main, ours) = load(repo, source)?;
+        evaluate(cache, main, &ours, source, ExportFormat::Yaml)
+    })
+}
+
+/// Parses `text` as YAML with nickel's parser, as data: YAML has no
+/// imports, so this reads nothing. `name` is for error messages.
+pub fn yaml_to_json(name: &str, text: &str) -> Result<serde_json::Value> {
+    let json = on_big_stack(|| {
+        let mut cache = CacheHub::new();
+        let id = cache.sources.add_string(
+            SourcePath::Path(name.into(), InputFormat::Yaml),
+            text.to_owned(),
+        );
+        evaluate(cache, id, &HashSet::from([id]), name, ExportFormat::Json)
+    })?;
+    serde_json::from_str(&json).with_context(|| format!("reading {name} back as JSON"))
 }

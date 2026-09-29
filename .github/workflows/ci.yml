@@ -79,10 +79,12 @@ jobs:
           if grep -rlE 'ACTIONS_RUNTIME_TOKEN|RUNNER-SECRET-MARKER' artifacts; then echo "an artifact leaked a secret"; exit 1; fi
   agent-review:
     uses: ./.github/workflows/agent-review.lock.yml
+  actions-test:
+    uses: ./.github/workflows/actions-test.lock.yml
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review]
+    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review, actions-test]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed

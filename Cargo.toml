@@ -20,6 +20,12 @@ clap = { version = "4", features = ["derive"] }
 # deliberately and regenerate the lock files. 0.19.0 is the core of
 # nickel-lang-cli 1.18.0.
 nickel-lang-core = { version = "=0.19.0", default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+# Fetches the action.yml of actions to lock; `check` never uses it.
+ureq = "3"
 
 [dev-dependencies]
 tempfile = "3"

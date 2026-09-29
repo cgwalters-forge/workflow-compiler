@@ -18,13 +18,20 @@ use cap_std_ext::cap_std::ambient_authority;
 use cap_std_ext::cap_std::fs::{Dir, OpenOptions};
 use cap_std_ext::dirext::CapStdExtDirExt;
 
-use crate::{LOCKS_DIR, SOURCES_DIR};
+use crate::{LOCKS_DIR, SOURCES_DIR, actions};
 
 /// What a compile may read, relative to the repository root: the
 /// compiler's library and runtime, which the lock files embed, the
-/// sources, the tests, and the lock files `check` compares with. Not
-/// `.git`, nor anything else in the checkout.
-pub const READABLE: &[&str] = &["lib", "runtime", SOURCES_DIR, "tests", LOCKS_DIR];
+/// sources, the tests, the actions' metadata, and the lock files `check`
+/// compares with. Not `.git`, nor anything else in the checkout.
+pub const READABLE: &[&str] = &[
+    "lib",
+    "runtime",
+    SOURCES_DIR,
+    "tests",
+    actions::LOCK_FILE,
+    LOCKS_DIR,
+];
 
 /// The largest file wfc reads. Everything it reads is a source, a script
 /// or a lock file, so a larger one is a mistake or an attack.

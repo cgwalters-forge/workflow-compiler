@@ -4,12 +4,14 @@
 //! `.github/workflows/`. Everything it reads and writes goes through the
 //! repository's directory fd ([`repo`]).
 
+pub mod actions;
 pub mod nickel;
 pub mod repo;
 
+use std::collections::{BTreeMap, btree_map};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::repo::Repo;
 
@@ -24,11 +26,15 @@ pub const REJECT_DIR: &str = "tests/reject";
 pub const REGENERATE: &str = "cargo run -- compile";
 /// The prefix of a reject test's expected message.
 const EXPECT: &str = "# expect: ";
+/// How many rounds of locking new actions a compile may take: each
+/// round locks what the sources are missing, and a composite action can
+/// pull in more.
+const MAX_LOCK_ROUNDS: usize = 50;
 
 /// What to do with the repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Write the lock files.
+    /// Write the lock files, locking new actions.
     Compile,
     /// Fail if anything `Compile` writes is stale, and run the tests.
     Check,
@@ -95,7 +101,7 @@ fn stale(path: &str, source: &str, committed: Option<&str>, compiled: &str) -> O
 }
 
 /// Compiles or checks the repository at `root`, returning the problems
-/// found.
+/// found. Only fetching new actions' metadata happens outside it.
 pub fn run(root: &Path, mode: Mode) -> Result<Vec<String>> {
     let repo = Repo::open(root)?;
     match mode {
@@ -105,7 +111,8 @@ pub fn run(root: &Path, mode: Mode) -> Result<Vec<String>> {
 }
 
 fn check(root: &Repo) -> Result<Vec<String>> {
-    let mut problems = Vec::new();
+    let lock = actions::read_lock(root)?;
+    let mut problems = actions::check_lock(root, &lock);
     let sources = root.list(SOURCES_DIR, ".ncl")?;
     for source in &sources {
         let path = lock_path(source);
@@ -142,9 +149,10 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     eprintln!(
-        "checked {} lock files and {} reject tests",
+        "checked {} lock files, {} reject tests and {} locked actions",
         sources.len(),
-        rejects.len()
+        rejects.len(),
+        lock.len()
     );
     Ok(problems)
 }
@@ -155,17 +163,58 @@ struct Pass {
     problems: Vec<String>,
     /// Files to write, relative to the root, with their contents.
     outputs: Vec<(String, String)>,
+    /// Actions the sources use that aren't locked yet, with their entries
+    /// if they are fixtures.
+    missing: BTreeMap<String, Option<actions::Entry>>,
+}
+
+impl Pass {
+    /// Records the failure `e` to compile `source`, unless it is only a
+    /// missing action.
+    fn failed(
+        &mut self,
+        root: &Repo,
+        lock: &actions::Lock,
+        source: &str,
+        e: anyhow::Error,
+        expected: bool,
+    ) -> Result<()> {
+        let report = format!("{e:#}");
+        match actions::missing_action(&report) {
+            Some(uses) if lock.contains_key(&uses) => {
+                self.problems.push(format!(
+                    "{source}: {uses} is locked, but gha.ncl can't find it:\n{report}"
+                ));
+            }
+            Some(uses) => {
+                if let btree_map::Entry::Vacant(missing) = self.missing.entry(uses) {
+                    let fixture = actions::lock_fixture(root, missing.key())?;
+                    missing.insert(fixture);
+                }
+            }
+            None if expected => {}
+            None => self.problems.push(report),
+        }
+        Ok(())
+    }
 }
 
 /// Compiles every source, writing nothing.
 fn compile_pass(root: &Repo) -> Result<Pass> {
+    let lock = actions::read_lock(root)?;
     let mut pass = Pass::default();
     for source in root.list(SOURCES_DIR, ".ncl")? {
         match nickel::export_yaml(root, &source) {
             Ok(yaml) => pass
                 .outputs
                 .push((lock_path(&source), header(&source) + &yaml)),
-            Err(e) => pass.problems.push(format!("{e:#}")),
+            Err(e) => pass.failed(root, &lock, &source, e, false)?,
+        }
+    }
+    // Only to lock the actions they use; they must still fail to compile.
+    for source in root.list(REJECT_DIR, ".ncl")? {
+        if let Err(e) = nickel::export_yaml(root, &source) {
+            pass.failed(root, &lock, &source, e, true)?;
         }
     }
     Ok(pass)
@@ -183,7 +232,26 @@ fn write_outputs(root: &Repo, outputs: &[(String, String)]) -> Result<()> {
 }
 
 fn compile(root: &Repo) -> Result<Vec<String>> {
-    let pass = compile_pass(root)?;
-    write_outputs(root, &pass.outputs)?;
-    Ok(pass.problems)
+    // Fixtures are relocked from tests/actions/ on every compile.
+    let mut lock = actions::read_lock(root)?;
+    let relocked = actions::relock_fixtures(root, &mut lock)?;
+    if relocked {
+        actions::write_lock(root, &lock)?;
+    }
+    for _ in 0..MAX_LOCK_ROUNDS {
+        let pass = compile_pass(root)?;
+        if pass.missing.is_empty() {
+            write_outputs(root, &pass.outputs)?;
+            return Ok(pass.problems);
+        }
+        for (uses, fixture) in pass.missing {
+            let entry = match fixture {
+                Some(entry) => entry,
+                None => actions::fetch(&uses)?,
+            };
+            lock.insert(uses, entry);
+        }
+        actions::write_lock(root, &lock)?;
+    }
+    bail!("the sources still need new actions after {MAX_LOCK_ROUNDS} rounds of locking")
 }
