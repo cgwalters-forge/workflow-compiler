@@ -305,7 +305,11 @@ let PublishStep = fun publish_ids => std.contract.Sequence [
 ] in
 
 let Sandbox = {
-  user | String | validator (fun s => std.string.is_match USER_RE s) (fun s => "invalid user name `%{s}`") | default = "runner-sandbox",
+  # Never the runner (whose tokens the sandbox must not reach) nor root.
+  user | String
+    | validator (fun s => std.string.is_match USER_RE s) (fun s => "invalid user name `%{s}`")
+    | validator (fun s => !(std.array.elem s ["root", "runner"])) (fun s => "sandbox.user can't be `%{s}`: the sandbox must be another user than the runner and root")
+    | default = "runner-sandbox",
   # Take root away from the runner user too, once the sandbox is entered;
   # its only sudo rule left is the wrapper.
   lock_runner_sudo | Bool | default = true,
