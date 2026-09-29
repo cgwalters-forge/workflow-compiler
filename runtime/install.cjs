@@ -46,6 +46,7 @@ if (run("sh", ["-c", "command -v run0"], { check: false }).status !== 0) {
 const runner = process.env.SUDO_USER;
 if (!runner || runner === "root") throw new Error("must be started with sudo by the runner user");
 const user = CONFIG.user;
+if (user === runner || user === "root") throw new Error(`the sandbox user can't be ${user}: it must be another user than the runner and root`);
 
 // A runner that ran a job before would hand this one the previous job's
 // sandbox and workspace: refuse it. (The user itself may come with the
@@ -58,6 +59,10 @@ if (run("getent", ["passwd", user], { check: false }).status !== 0) {
 }
 const sandbox = passwd(user);
 const runnerHome = passwd(runner).home;
+// Also by uid: another name for root or the runner is still them.
+if (sandbox.uid === 0 || sandbox.uid === passwd(runner).uid) {
+  throw new Error(`the sandbox user ${user} has uid ${sandbox.uid}, root's or the runner's`);
+}
 
 fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o755 });
 // The sandbox works on its own copy of what the job hands it (the files git
