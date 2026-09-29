@@ -322,21 +322,25 @@ its prompt.
 What a sandboxed step hands to anything running as runner is data the
 wrapper validated: its outputs (`name=value` lines, with names checked), its
 step summary, and staged outputs, each read without following symlinks and
-with a size cap, after every process of the step is gone. Two channels are
-not validated, and everything downstream must treat them as untrusted: the
-step's exit status, which decides its outcome and whether later
-`success()` steps run; and its standard output and error, which go to the
-job's log.
+with a size cap, after every process of the step is gone. Its standard
+output and error go to the job's log with every workflow command
+neutralized except annotations (`warning`, `error`, `notice`) and
+`debug`, which only show text. One channel is not validated, and everything
+downstream must treat it as untrusted: the step's exit status, which
+decides its outcome and whether later `success()` steps run.
 
 **Status:** partial. Outputs are `name=value` lines or the heredoc form
 `@actions/core` writes for every value, re-encoded by the runner side with
 a delimiter of its own, so a value can't end early and set another name.
 `GITHUB_ENV` and `GITHUB_PATH` apply to later sandboxed steps only, never
 to the runner, and can't set what the wrapper sets itself (`PATH`, `LD_*`,
-`NODE_*`, `RUNNER_*` and the like). Standard output reaches the runner's parser of
-workflow commands, so a step can still use `::set-output` or `::add-mask::`
-([#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17)).
-Staged outputs have no size cap
+`NODE_*`, `RUNNER_*` and the like). The wrapper's root side passes on the
+sandbox's output line by line, breaking lines where the runner's reader
+does (`\n`, `\r`), and marks any other `::command` at the start of a line
+and any legacy `##[command]` anywhere in it, so the runner doesn't act on
+them ([#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17)).
+Annotations are allowed because linters report through them; the runner
+caps how many a step can make. Staged outputs have no size cap
 ([#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18)),
 and files the sandbox leaves in `/dev/shm` or its workspace stay readable
 to runner until the seal, which hides or removes them.
@@ -346,7 +350,10 @@ to runner until the seal, which hides or removes them.
 bad name"; `actions-test` steps "Set environment for later sandboxed
 steps", "Read it back", "The sandbox can't set what the wrapper sets", "An
 unterminated heredoc output fails the step" and the publish step "Nothing
-the sandbox set reached the runner"; `tests/runtime/filecmd.test.cjs`; the
+the sandbox set reached the runner"; `sandbox-test` steps "Issue workflow
+commands" and "No command took effect"; `tests/runtime/filecmd.test.cjs`
+(file commands, and every workflow command across chunks and line
+breaks); the
 upload steps that point at
 `/proc/self/environ` and the runner's files through symlinks, and
 `sandbox-test-artifacts`.
@@ -594,7 +601,7 @@ these gaps, all sub-issues of
 [tracker#88](https://github.com/cgwalters-forge/tracker/issues/88) and in
 the roadmap in the [README](../README.md#status-and-roadmap):
 
-- [#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17): workflow commands on a sandboxed step's standard output (R7);
+- [#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17): workflow commands on a sandboxed step's standard output (R7) (fixed);
 - [#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18): no size cap on staged outputs (R7);
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19): `runner_steps` that execute a pull request's checkout (R10);
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20): caches from the sandbox or untrusted runs restored as runner (R13);
