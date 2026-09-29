@@ -67,12 +67,27 @@ or `issue_comment`, and the board-driven agents of
 their text in front of the job, as event data and as an agent's input. That
 text is untrusted wherever it goes (R12).
 
+**Everyone else whose text an agent reads** is in the same position:
+authors of pull request descriptions and review comments, of the code whose
+build and test output lands in CI logs, of a repository's `AGENTS.md` or
+`CONTRIBUTING.md` on a branch under review, of web pages, and of comments on
+gists and board items. None of them triggers the job, but each can put
+instructions in front of the agent it runs (see
+[Prompt injection](#prompt-injection)).
+
+**Intake reviewers** are model calls that read an item's untrusted text
+before the board lets an agent act on it, and return a verdict (R15). They
+see the same hostile text as the agent, so they are treated like it: no
+tools, no credentials, and a verdict that is only data for a later step.
+They can be wrong, and are one layer, not the boundary.
+
 **The agent** is a model-driven process, such as a coding agent run by
 `agent_run`, working in the sandbox. It is treated exactly like a hostile
 build payload: it may have been steered by text it read (an issue, a pull
 request, a web page, a file in the checkout) and do anything its user can
 do. It is never trusted with credentials, and its results are data for a
-later, privileged phase or job to validate.
+later, privileged phase or job to validate, which caps how many of them
+take effect (R16).
 
 **Action authors** publish the actions a job uses. An action runs with
 whatever the phase it is in gives it, so the phase decides how much its
@@ -135,6 +150,30 @@ to apply an agent's results with write credentials. The workflow compiler
 works inside one job; `publish_steps` (R8) is the in-job equivalent for
 credentials whose loss is tolerable, such as the runtime token that uploads
 artifacts.
+
+## Prompt injection
+
+The threat this compiler exists for, in agent jobs, is prompt injection:
+text an attacker wrote, in any of the places the actors above name, that
+steers the agent into acting for them. It needs no bug in the job, only an
+agent that reads. It is not solved by telling the agent to treat text as
+data, nor by a reviewer that looks for it, though both help. So the
+guarantees here assume it succeeds: a steered agent still can't reach a
+credential (R3), leave the sandbox (R1), or turn its text into privileged
+code (R12, R13). What it can still do is propose writes, and R16 bounds
+those.
+
+Two layers sit in front of the sandbox, outside it:
+
+- the **intake review** (R15), which keeps obviously hostile or off-scope
+  text from reaching an agent unseen by a human, so an attack costs a
+  human decision rather than a run;
+- **provenance**: board text reaches the agent only in shares, labeled
+  with its source and author and fenced so it can't close its own fence.
+
+The design and threat examples are in the
+[prompt-injection defense gist](https://gist.github.com/cgwalters-bot/9695d2f2bdeabf4dbb6880ca77fa54de),
+tracked by [tracker#225](https://github.com/cgwalters-forge/tracker/issues/225).
 
 ## Phases and data flow
 
@@ -634,6 +673,65 @@ passing as unchanged.
 `export-subst` and `ident` don't change what is extracted, and that a
 symlink is refused. Once merged, the same pull requests are the test.
 
+### R15. Untrusted text is reviewed before the board hands it to an agent
+
+Before a board item's untrusted text (its body, comments by anyone but the
+maintainer who owns the board, a pull request description, an excerpt of a
+CI log) is given to an agent, an intake review reads it, and again when
+that text changes. The review is at least two model calls from different
+model families, each with no tools and no credentials, over text a
+deterministic step fetched and fenced. Each returns `ok`, `suspicious` or
+`hostile` with reasons, flagging injection attempts, instructions aimed at
+agents, requests outside the item's scope, and requests for secrets or
+exfiltration. The item goes ahead only if every reviewer returns `ok`; a
+flag, a disagreement, an error or a timeout holds it for a human. The
+verdicts are staged outputs like any other, and the only writes they lead
+to are to the planning system (the item's status and a verdict comment),
+made by a separate step.
+
+In a compiled job the fetch is a `runner_steps` share, the reviewers are
+an `agent_run` in `steps` with an empty toolset, and the write is the
+task layer's apply job. The job is started by the board's poll, not by
+issue or comment events, so an attacker can't make it run at will.
+
+**Status:** planned
+([tracker#226](https://github.com/cgwalters-forge/tracker/issues/226)).
+The compiler's part is that the reviewers' job has no token and an empty
+toolset, which a lint can check once `agent_run` takes a toolset.
+
+**Proof:** none yet. The planned test is an eval set of hostile and benign
+items (a hostile issue comment, a pull request description with hidden
+instructions, a CI log with commands in it) run through the job, which
+fails if a hostile item passes or a benign one is held.
+
+### R16. An agent's writes are capped, validated outputs applied elsewhere
+
+An agent job holds no write credential for the forge. Everything it wants
+to change outside the sandbox is a staged output of an allowed kind
+(pushing a branch of its fork, a draft pull request, a comment on a pull
+request of its own, a question, an update of its own board item), which
+the task declares with a maximum count for each kind. A separate job,
+another VM with its own short-lived token, validates each output against
+that declaration, sanitizes its text, applies it, and records what it did.
+Beyond the per-run caps, the applier enforces rate limits across runs (so
+many comments or pushes an hour), and stops on a kill switch that a human
+or anomaly detection can set, leaving the outputs queued. `publish_steps`
+(R8) keep the credentials whose loss is tolerable, such as the runtime
+token that uploads artifacts; forge writes are not among them.
+
+**Status:** planned. Per-run caps are part of the task format
+([tracker#88](https://github.com/cgwalters-forge/tracker/issues/88)) and
+safe outputs
+([tracker#60](https://github.com/cgwalters-forge/tracker/issues/60));
+rate limits and the kill switch are
+[tracker#228](https://github.com/cgwalters-forge/tracker/issues/228). The
+compiler's part is refusing a forge write token in an agent job's
+`publish_steps`, which it doesn't check yet.
+
+**Proof:** none yet. The planned tests are fixtures of over-cap outputs,
+outputs of a kind the task doesn't allow, a forged footer marker, and a set
+kill switch, each of which the applier must refuse.
+
 ## Non-goals
 
 **A kernel boundary.** The sandbox is a different uid on the same kernel,
@@ -662,7 +760,8 @@ self-hosted runners are not supported (R10).
 **Validating results for other jobs.** Staged outputs, artifacts and
 outputs are untrusted data wherever they go next (R13). A job that applies
 an agent's results (the task layer's `apply` job) validates them itself, as
-gh-aw's safe-outputs job does.
+gh-aw's safe-outputs job does; R16 says what it must enforce, but the
+compiler doesn't implement it.
 
 **Runners other than systemd 256 or later.** Sandboxed steps need `run0`:
 ubuntu-26.04 and RHEL 10, not ubuntu-24.04
@@ -703,8 +802,9 @@ the sandbox user, its instructions come from a share it can't rewrite, and
 its only effects are staged outputs that a privileged phase or a separate
 job validates. That makes the board a safe input only if the task layer
 keeps board text out of the privileged phases and out of every expression
-(R12), putting it only in shares or sandbox inputs; the workflow compiler
-is the layer that enforces the rest.
+(R12), putting it only in shares or sandbox inputs, has it reviewed before
+an agent sees it (R15), and caps what the agent's outputs can do (R16); the
+workflow compiler is the layer that enforces the rest.
 
 ## Gaps tracked as issues
 
