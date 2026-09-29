@@ -1,0 +1,8 @@
+# A composite action reading the caller's steps, where runner_steps
+# outputs (a token) could be.
+name: composite-steps-context
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo '${{ toJSON(steps) }}'
