@@ -79,12 +79,61 @@ jobs:
           if grep -rlE 'ACTIONS_RUNTIME_TOKEN|RUNNER-SECRET-MARKER' artifacts; then echo "an artifact leaked a secret"; exit 1; fi
   agent-review:
     uses: ./.github/workflows/agent-review.lock.yml
+  # What agent-review's fake agent run produced, through stage, seal and
+  # publish: the task layer's summary.json and the ACP transcript.
+  agent-review-artifacts:
+    needs: agent-review
+    runs-on: ubuntu-latest
+    env:
+      # The bot-harness commit lib/agent-run.ncl pins, for redact.mjs's
+      # patterns.
+      HARNESS_SHA: 13308dc5480bc9f89dbf4b9abfabc7972222db8e
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: agent-*
+      # Each artifact holds the staged directory under its own name.
+      - name: The run summary and transcript are complete
+        env:
+          RUN: agent-run/agent-run
+          TRANSCRIPT: agent-transcript/agent-transcript
+        run: |
+          set -euo pipefail
+          find agent-run agent-transcript -ls
+          cat "$RUN/summary.md" >>"$GITHUB_STEP_SUMMARY"
+          jq . "$RUN/summary.json"
+          jq -e '.schema == "agent-run-summary/v1" and .agent == "fake" and .result == "success"' "$RUN/summary.json"
+          jq -e '[.permissions.denied[].rule] | index("no-push") != null' "$RUN/summary.json"
+          jq -e '.redactions >= 1 and (.files | index("FAKE.md") != null)' "$RUN/summary.json"
+          # The fake agent's outcome.json, with the test it reports.
+          jq -e '.tests | length == 1' "$RUN/outcome.json"
+          test "$(wc -l <"$TRANSCRIPT/acp.jsonl")" -gt 10
+          jq -e . "$TRANSCRIPT/harness.json" >/dev/null
+          # Every escape the scripted agent tried failed (the old stub's
+          # checks, now the agent's own; lib/agent-run.ncl).
+          for e in rewrite-prompt add-to-share sudo worker-environ runner-home job-token; do
+            grep -q "contained-$e" "$TRANSCRIPT/acp.jsonl" || { echo "no result for the $e attempt"; exit 1; }
+          done
+          if grep -o 'ESCAPED-[a-z-]*' "$TRANSCRIPT/acp.jsonl"; then echo "an escape attempt succeeded"; exit 1; fi
+          # Nothing uploaded matches the redaction patterns.
+          curl -sSfL -o redact.mjs "https://raw.githubusercontent.com/cgwalters-forge/cgwalters-devspace-sandbox/$HARNESS_SHA/agent/redact.mjs"
+          # shellcheck disable=SC2016 # the ${} are JavaScript's
+          node --input-type=module -e '
+            import { readFileSync, readdirSync } from "node:fs";
+            import { SECRET_PATTERNS } from "./redact.mjs";
+            const re = new RegExp(SECRET_PATTERNS.map((p) => `(?:${p})`).join("|"));
+            const files = readdirSync(".", { recursive: true }).filter((f) => /^agent-(run|transcript)\//.test(f));
+            const bad = files.filter((f) => { try { return re.test(readFileSync(f, "utf8")); } catch { return false; } });
+            if (bad.length) { console.error("secret-shaped strings in", bad); process.exit(1); }
+            console.log(`${files.length} paths scanned, nothing secret-shaped`);
+          ' 
+          head -n 20 "$RUN/condensed.log"
   actions-test:
     uses: ./.github/workflows/actions-test.lock.yml
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review, actions-test]
+    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review, agent-review-artifacts, actions-test]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed
