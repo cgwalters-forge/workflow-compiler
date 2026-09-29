@@ -95,8 +95,12 @@ gha.compile {
       {
         name = "The job's credentials are out of reach",
         run = m%"
-          for v in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN GITHUB_ENV GITHUB_PATH; do
+          for v in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN; do
             if [[ -v $v ]]; then echo "$v is set"; exit 1; fi
+          done
+          # The file commands are the sandbox's own.
+          for v in GITHUB_ENV GITHUB_PATH GITHUB_OUTPUT GITHUB_STATE GITHUB_STEP_SUMMARY; do
+            test "$(stat -c %U "$(dirname "${!v}")")" = runner-sandbox
           done
           worker=$(pgrep -f Runner.Worker | head -n1)
           test -n "$worker"
@@ -151,10 +155,10 @@ gha.compile {
         run = m%"ln -sf /etc/shadow "$GITHUB_OUTPUT""%,
       },
       {
-        name = "Smuggle a multi-line output",
+        name = "Smuggle an output with a bad name",
         id = "heredoc",
         "continue-on-error" = true,
-        run = m%"printf 'x<<EOF\nsomething\nEOF\n' >>"$GITHUB_OUTPUT""%,
+        run = m%"printf 'x y<<EOF\nsomething\nEOF\n' >>"$GITHUB_OUTPUT""%,
       },
       {
         name = "Leave a process behind",

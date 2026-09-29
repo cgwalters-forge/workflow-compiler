@@ -1,0 +1,4 @@
+name: js-main-expression
+runs:
+  using: node24
+  main: dist/${{ github.token }}.js
