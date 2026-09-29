@@ -66,7 +66,7 @@ in
 # as runner under node before anything is validated, so names that change
 # how a program starts or where it finds others are refused here, along
 # with the ones runner-sandbox-run refuses anyway.
-let DENIED_ENV_RE = "^(ACTIONS_|RUNNER_|GITHUB_(TOKEN|ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)$|LD_|NODE_|(BASH_ENV|ENV|PATH|HOME|USER|LOGNAME|SHELL)$)" in
+let DENIED_ENV_RE = "^(ACTIONS_|RUNNER_|GITHUB_(TOKEN|ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)$|LD_|NODE_|OPENSSL_(CONF|MODULES)$|(BASH_ENV|ENV|PATH|HOME|USER|LOGNAME|SHELL)$)" in
 let SafeEnvNames = validator
   (fun env => std.array.all (fun n => !(std.string.is_match DENIED_ENV_RE n)) (std.record.fields env))
   (fun env =>

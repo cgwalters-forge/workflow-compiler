@@ -149,7 +149,7 @@ static WHOLE_ENV: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)(?-u:\b)env\s*(\[|
 /// runner side of the wrapper starts. The wrapper's own are allowed.
 static DENIED_ENV: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"^(ACTIONS_|RUNNER_|GITHUB_(TOKEN|ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)$|LD_|NODE_|(BASH_ENV|ENV|PATH|HOME|USER|LOGNAME|SHELL)$)",
+        r"^(ACTIONS_|RUNNER_|GITHUB_(TOKEN|ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)$|LD_|NODE_|OPENSSL_(CONF|MODULES)$|(BASH_ENV|ENV|PATH|HOME|USER|LOGNAME|SHELL)$)",
     )
 });
 static WRAPPER_ENV: LazyLock<Regex> =
