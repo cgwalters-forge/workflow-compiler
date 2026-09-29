@@ -103,12 +103,12 @@ else. The lock file in `.github/workflows/` is a deterministic function of
 the reviewed source and of this repository's contracts and runtime scripts,
 which the lock file embeds; the stale-lock check fails `ci` on any
 difference. So reviewing the source is reviewing the job, and the source's
-schema has no way to say "run this later step as runner". The check itself
-runs from the pull request's own `ci.yml`, `compile.mjs`, `lib/` and
-`runtime/`, with a nickel binary it downloads, so those files are inside
-the boundary too: a pull request that changes them can make a stale lock
-file pass, and they need the same review as the lock files
-([#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26)).
+schema has no way to say "run this later step as runner". `ci` runs the
+check from the pull request's own tree, where a change to `ci.yml`,
+`compile.mjs` or `lib/` could make a stale lock file pass; so the same
+checks also run from the base branch's code, in `trusted-check`, with the
+pull request only as data, and a change to the compiler itself needs a
+maintainer's fresh label (R14).
 
 The **uid boundary** is between the runner user and the sandbox user
 (`runner-sandbox`). It is the one that holds at run time against hostile
@@ -208,9 +208,8 @@ requires it to have succeeded; and no job or workflow sets `env`,
 `defaults`, `container`, `services` or a job-level `uses`. Any other file
 in `.github/workflows/` must be listed, with its reason, in
 `.github/uncompiled-workflows` (here, `ci.yml`), and every lock file needs
-a source. This proves the repository's own tree; that the tree `ci` runs
-the check from is trustworthy is
-[#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26).
+a source. `trusted-check` runs this from the base branch's code too
+(R14).
 
 **Proof:** the reject tests in `tests/reject/` (`shell-override`,
 `working-directory`, `job-container`, `job-defaults`, and the others), which
@@ -475,10 +474,9 @@ there, the pull request's code may only be checked out and run inside the
 sandbox ([#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19)),
 and event text may only reach privileged steps as data (R12).
 
-**The repository requires `ci`**, including the stale-lock check, before
-anything merges, and its maintainers review changes to `ci.yml`,
-`compile.mjs`, `lib/` and `runtime/` like lock files
-([#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26)).
+**The repository requires `ci` and `trusted-check`** before anything
+merges (R14), and its maintainers review changes to the compiler like
+lock files, which the `compiler-change` label records.
 
 **The privileged phase doesn't run code from an untrusted checkout.**
 `runner_steps` run as runner with sudo: a `run: make deps` there, on a
@@ -561,6 +559,41 @@ holds only for one that does.
 
 **Status:** not enforced
 ([#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20)).
+
+### R14. The lock files are checked by code the pull request can't change
+
+`ci` checks a pull request with the pull request's own `ci.yml`,
+`compile.mjs`, `lib/` and `runtime/`, which the pull request can change
+so that a lock file that doesn't match its source, or doesn't have the
+compiled shape, passes. So `trusted-check` runs the same checks with the
+base branch's code. It is a `pull_request_target` workflow, so its file
+and everything it runs come from the base branch; with only
+`contents: read` and no secrets. The pull request's tree is data: its
+blobs are extracted with `git archive` into a directory that is never
+executed or built, and refused if it holds a symlink or special file. The
+base's `wfc`, built from the base checkout alone, compiles the pull
+request's sources, with its reads confined to that directory by Landlock,
+and compares the lock files; the base's `lib/check-lock.mjs` checks their
+shape (R1).
+
+Both still compile with the pull request's `lib/` and check against its
+`runtime/`: those are the compiler, and a pull request may change them.
+Any change to them, to `compile.mjs`, `wfc/`, the uncompiled-workflows
+list or a workflow that isn't a lock file needs a maintainer to review it
+and then apply the `compiler-change` label. Only the labeling event
+itself passes the check, so a push after the label makes it fail again
+until the label is applied anew; applying labels takes triage access to
+the repository.
+
+**Status:** holds once `trusted-check` is a required check in the branch
+ruleset, which only an administrator can set. Evaluating the pull
+request's nickel is still running its code, in an interpreter with no
+I/O but reads, confined by Landlock and bounded by the job's timeout.
+
+**Proof:** test pull requests against the branch that adds the workflow,
+in the pull request that adds it: an honest change to a source passes; a
+hand-edited lock file fails at the compare; a change to `compile.mjs`
+fails at the label gate.
 
 ## Non-goals
 
@@ -648,7 +681,7 @@ the roadmap in the [README](../README.md#status-and-roadmap):
 - [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21): nothing checks the repository settings (R10);
 - [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22): unrestricted network egress ([Non-goals](#non-goals));
 - [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25): expressions from events in privileged `run:` steps (R12) (fixed);
-- [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26): the stale-lock check runs the pull request's own compiler (review boundary, R10);
+- [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26): the stale-lock check runs the pull request's own compiler (review boundary, R10) (fixed, R14);
 - [#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27): local sockets and localhost services (R2, R3);
 - [#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28): the ephemeral-runner assumption (R5, R10);
 - [#29](https://github.com/cgwalters-forge/workflow-compiler/issues/29): explicit token permissions (R10);

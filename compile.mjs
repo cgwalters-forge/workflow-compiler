@@ -29,7 +29,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkWorkflow } from "./lib/check-lock.mjs";
+import { checkTree } from "./lib/check-lock.mjs";
 
 const ROOT = import.meta.dirname;
 const SOURCES = "workflows";
@@ -41,11 +41,8 @@ const REJECT = "tests/reject";
 const ACCEPT = "tests/accept";
 const OUT = ".github/workflows";
 const ACTIONS_LOCK = "actions.lock.json";
-// Workflows in OUT that aren't compiled, one name per line with a reason
-// after `#`: they run with none of the compiler's guarantees, so each is
-// a reviewed exception.
+// Workflows in OUT that aren't compiled (see lib/check-lock.mjs).
 const UNCOMPILED = ".github/uncompiled-workflows";
-const RUNTIME = "runtime";
 const NICKEL = process.env.NICKEL ?? "nickel";
 const TEST_OWNER = "wfc-test";
 const TEST_ACTIONS = "tests/actions";
@@ -206,37 +203,7 @@ for (const src of nclFiles(ACCEPT)) {
   } else console.log(`ok: ${src} compiles to ${expected}`);
 }
 
-// Every workflow is a lock file with the compiled shape, or a listed
-// exception.
-function checkWorkflows() {
-  const found = [];
-  const listed = existsSync(path.join(ROOT, UNCOMPILED))
-    ? readFileSync(path.join(ROOT, UNCOMPILED), "utf8").split("\n").map((l) => l.replace(/#.*/, "").trim()).filter(Boolean)
-    : [];
-  const runtime = Object.fromEntries(readdirSync(path.join(ROOT, RUNTIME)).map((f) => [f, readFileSync(path.join(ROOT, RUNTIME, f), "utf8")]));
-  for (const file of readdirSync(path.join(ROOT, OUT)).sort()) {
-    const rel = path.join(OUT, file);
-    if (!/\.ya?ml$/.test(file)) continue;
-    if (!file.endsWith(".lock.yml")) {
-      if (!listed.includes(file)) found.push(`${rel} isn't compiled; compile it from workflows/, or list it in ${UNCOMPILED} with the reason`);
-      continue;
-    }
-    if (!existsSync(path.join(ROOT, SOURCES, file.replace(/\.lock\.yml$/, ".ncl")))) {
-      found.push(`${rel} has no source in ${SOURCES}/`);
-      continue;
-    }
-    const r = nickelExport(rel, "json");
-    if (!r.ok) {
-      found.push(`${rel} can't be parsed:\n${r.stderr}`);
-      continue;
-    }
-    for (const p of checkWorkflow(JSON.parse(r.stdout), runtime)) found.push(`${rel}: ${p}`);
-  }
-  for (const name of listed) if (!existsSync(path.join(ROOT, OUT, name))) found.push(`${UNCOMPILED} lists ${name}, which doesn't exist`);
-  return found;
-}
-
-if (check) problems.push(...checkWorkflows());
+if (check) problems.push(...checkTree(ROOT, { uncompiled: path.join(ROOT, UNCOMPILED), nickel: NICKEL }));
 
 if (!check) {
   // Only to lock the actions they use; they must still fail to compile.

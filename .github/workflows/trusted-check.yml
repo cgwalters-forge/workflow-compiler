@@ -1,0 +1,117 @@
+# The stale-lock and shape checks, run from code the pull request can't
+# change (#26). ci.yml runs them too, but from the pull request's own
+# tree, where a change to compile.mjs, lib/ or ci.yml can make them pass
+# whatever the lock files say.
+#
+# This runs on pull_request_target, so the workflow and every script it
+# runs are the base branch's. The pull request's tree is only data: its
+# blobs are extracted with git archive into head/ and never executed or
+# built. The base's wfc (built from base/) compiles head/'s sources with
+# reads confined to head/ by Landlock, and the base's lib/check-lock.mjs
+# checks head/'s lock files. A pull request that changes the compiler
+# itself (lib/, runtime/, compile.mjs, wfc/, the uncompiled-workflows
+# list or a workflow that isn't a lock file) passes only once a
+# maintainer labels it `compiler-change` after its last push: a push
+# makes this fail again until the label is applied anew.
+# docs/requirements.md (R14) has the trust model.
+name: trusted-check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NICKEL_VERSION: 1.18.0
+      NICKEL_SHA256: 9cba4dd65ae9915ec61f73033aafcff307a377665a83fd8f530df086763318cb
+      # Paths whose change is a change of the compiler, reviewed by hand.
+      COMPILER_PATHS: lib runtime compile.mjs wfc .github/uncompiled-workflows
+      LABEL: compiler-change
+    steps:
+      - name: Check out the base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: base
+          fetch-depth: 0
+          persist-credentials: false
+
+      # As blobs, into a directory nothing here executes. The pull
+      # request's head is fetched by number from this repository, so a
+      # fork's needs no access of its own.
+      - name: Extract the pull request's tree as data
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git -C base fetch -q --no-tags "$SERVER/$REPO" "+refs/pull/$PR/head:refs/remotes/pr/head"
+          test "$(git -C base rev-parse refs/remotes/pr/head)" = "$HEAD_SHA"
+          mkdir head
+          git -C base archive --format=tar "$HEAD_SHA" | tar -x --no-same-owner --no-same-permissions -C head
+          # Symlinks would point reads out of head/.
+          if find head ! -type f ! -type d | grep .; then
+            echo "::error::the pull request's tree has symlinks or special files; refusing to read it"
+            exit 1
+          fi
+
+      - name: Changes to the compiler need a maintainer's fresh label
+        env:
+          ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Workflows that aren't lock files count as compiler too.
+          read -ra paths <<<"$COMPILER_PATHS"
+          mapfile -t changed < <(git -C base diff --name-only "$BASE_SHA...$HEAD_SHA" -- "${paths[@]}" \
+            ':(glob).github/workflows/*.yml' ':(glob).github/workflows/*.yaml' ':(exclude,glob).github/workflows/*.lock.yml')
+          if [ "${#changed[@]}" -eq 0 ]; then
+            echo "The compiler is unchanged."
+            exit 0
+          fi
+          echo "This pull request changes the compiler:"
+          printf '  %s\n' "${changed[@]}"
+          # Only the labeling itself counts: a label applied before the
+          # last push doesn't vouch for what was pushed after it.
+          if [ "$ACTION" = labeled ] && [ "$EVENT_LABEL" = "$LABEL" ]; then
+            echo "A maintainer labeled it $LABEL at this head."
+            exit 0
+          fi
+          echo "::error::the compiler changed; a maintainer must review it and then (re)apply the $LABEL label, after the last push"
+          exit 1
+
+      - name: Install nickel
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/nickel" "https://github.com/nickel-lang/nickel/releases/download/$NICKEL_VERSION/nickel-x86_64-linux"
+          echo "$NICKEL_SHA256  $RUNNER_TEMP/nickel" | sha256sum -c
+          chmod +x "$RUNNER_TEMP/nickel"
+
+      - name: Build wfc from the base
+        working-directory: base/wfc
+        run: cargo build --release --locked
+
+      - name: Lock files match their sources, compiled by the base's wfc
+        run: |
+          set -euo pipefail
+          cd head
+          # shellcheck disable=SC2046 # one argument per source
+          ../base/wfc/target/release/wfc --root . --check $(ls workflows/*.ncl)
+
+      - name: Every workflow has the compiled shape, by the base's rules
+        env:
+          NICKEL: ${{ runner.temp }}/nickel
+        run: node base/lib/check-lock.mjs head --uncompiled head/.github/uncompiled-workflows

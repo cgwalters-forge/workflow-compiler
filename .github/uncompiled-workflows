@@ -2,3 +2,4 @@
 # checked by `node compile.mjs --check`. Each runs with none of the
 # compiler's guarantees, so each needs its reason here.
 ci.yml  # this repository's own checks; runs no untrusted code with credentials (contents: read, no secrets), and calls the compiled workflows
+trusted-check.yml  # the check of the lock files from the base branch (#26); reads the pull request only as data, with contents: read
