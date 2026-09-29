@@ -22,6 +22,11 @@ pub const LOCKS_DIR: &str = ".github/workflows";
 /// Sources that must fail to compile, each with the message its
 /// `# expect:` line names.
 pub const REJECT_DIR: &str = "tests/reject";
+/// Sources that must compile, to what their .expected.yml next to them
+/// says, which is how tests of the compiler's rewriting (composite
+/// actions from tests/actions/, for one) check its output without making
+/// a workflow of it.
+pub const ACCEPT_DIR: &str = "tests/accept";
 /// How to regenerate what `compile` writes, from the repository root.
 pub const REGENERATE: &str = "cargo run -- compile";
 /// The prefix of a reject test's expected message.
@@ -34,7 +39,7 @@ const MAX_LOCK_ROUNDS: usize = 50;
 /// What to do with the repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Write the lock files, locking new actions.
+    /// Write the lock files and expected outputs, locking new actions.
     Compile,
     /// Fail if anything `Compile` writes is stale, and run the tests.
     Check,
@@ -55,6 +60,11 @@ pub fn lock_path(source: &str) -> String {
         .unwrap_or(source)
         .trim_end_matches(".ncl");
     format!("{LOCKS_DIR}/{stem}.lock.yml")
+}
+
+/// The expected output of the accept test `source`.
+fn expected_path(source: &str) -> String {
+    format!("{}.expected.yml", source.trim_end_matches(".ncl"))
 }
 
 /// Where two texts first differ: the 1-based line number and both lines.
@@ -129,6 +139,17 @@ fn check(root: &Repo) -> Result<Vec<String>> {
             }
         }
     }
+    let accepts = root.list(ACCEPT_DIR, ".ncl")?;
+    for source in &accepts {
+        let path = expected_path(source);
+        match nickel::export_yaml(root, source) {
+            Err(e) => problems.push(format!("{e:#}")),
+            Ok(yaml) => {
+                let committed = root.read(&path)?;
+                problems.extend(stale(&path, source, committed.as_deref(), &yaml));
+            }
+        }
+    }
     let rejects = root.list(REJECT_DIR, ".ncl")?;
     for source in &rejects {
         let text = root.read(source)?.unwrap_or_default();
@@ -149,8 +170,9 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     eprintln!(
-        "checked {} lock files, {} reject tests and {} locked actions",
+        "checked {} lock files, {} accept tests, {} reject tests and {} locked actions",
         sources.len(),
+        accepts.len(),
         rejects.len(),
         lock.len()
     );
@@ -203,12 +225,15 @@ impl Pass {
 fn compile_pass(root: &Repo) -> Result<Pass> {
     let lock = actions::read_lock(root)?;
     let mut pass = Pass::default();
-    for source in root.list(SOURCES_DIR, ".ncl")? {
-        match nickel::export_yaml(root, &source) {
-            Ok(yaml) => pass
-                .outputs
-                .push((lock_path(&source), header(&source) + &yaml)),
-            Err(e) => pass.failed(root, &lock, &source, e, false)?,
+    for (dir, is_accept) in [(SOURCES_DIR, false), (ACCEPT_DIR, true)] {
+        for source in root.list(dir, ".ncl")? {
+            match nickel::export_yaml(root, &source) {
+                Ok(yaml) if is_accept => pass.outputs.push((expected_path(&source), yaml)),
+                Ok(yaml) => pass
+                    .outputs
+                    .push((lock_path(&source), header(&source) + &yaml)),
+                Err(e) => pass.failed(root, &lock, &source, e, false)?,
+            }
         }
     }
     // Only to lock the actions they use; they must still fail to compile.
