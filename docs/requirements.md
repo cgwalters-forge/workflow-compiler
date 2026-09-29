@@ -203,8 +203,8 @@ the shim can't run.
 
 **Proof:** the reject tests in `tests/reject/` (`shell-override`,
 `working-directory`, `job-container`, `job-defaults`, and the others), which
-`wfc check` requires to fail with their expected message.
-Reject tests for `services` and job and workflow `env:` are missing. Gap:
+`wfc check` requires to fail with their expected message,
+`job-services`, `job-env` and `workflow-env` among them. Gap:
 `wfc check` proves each lock file matches its source, not that every
 workflow in `.github/workflows/` is a lock file or that a source went
 through `gha.compile` unmodified
