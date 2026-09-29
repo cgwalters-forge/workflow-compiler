@@ -439,6 +439,7 @@ fn finds_what_the_compilers_contracts_refuse() {
         ("an empty CONFIG", with_config(json!({})).build()),
         ("a stage path with ..", sandboxed(vec![json!({ "shell": "bash", "run": format!("{EXEC} --stage x ../../home/runner/.credentials") })]).build()),
         ("an unknown key on a sandboxed step", sandboxed(vec![with(wrap("sleep 1000"), json!({ "background": true }))]).build()),
+        ("OPENSSL_CONF for the wrapper's node", sandboxed(vec![with(wrap("id"), json!({ "env": { "OPENSSL_CONF": "/tmp/x.cnf", "RUNNER_SANDBOX_ENV": "OPENSSL_CONF" } }))]).build()),
         ("an action path with ..", sandboxed(vec![json!({ "shell": format!("{EXEC} --action-path o/../../x@{sha} {{0}}"), "run": "id" })]).build()),
         ("job permissions as a string", job(json!({ "permissions": "write-all" })).build()),
         ("a job environment", job(json!({ "environment": "prod" })).build()),
