@@ -38,11 +38,16 @@ in
 # hold `}}`, so rather than parse them this looks at all of S after each
 # `${{`. It's a lint against mistakes, not a boundary: a value runner_steps
 # put in GITHUB_ENV, for one, still reaches the sandbox through `env.X`.
+# The text after each `${{` in S (split gives [] for "").
+let expressions = fun s =>
+  let parts = std.string.split "${{" s in
+  if parts == [] then [] else std.array.drop_first parts
+in
 let CREDENTIALS_RE = "(?i)\\bsecrets\\b|\\bgithub\\s*(\\[|[,)}]|\\.\\s*token\\b)" in
 let mentions_credentials = fun s =>
   std.array.any
     (fun expr => std.string.is_match CREDENTIALS_RE expr)
-    (std.array.drop_first (std.string.split "${{" s))
+    (expressions s)
 in
 
 # Sandboxed steps never see the job's credentials, so they may not name them
@@ -81,6 +86,57 @@ let NoActionInSandbox = validator
   (fun step => "`%{step.uses}` can't run in `steps` yet: credentialed actions go in `publish_steps`, which read staged outputs, and pure actions will run in the sandbox through a shim (#16)")
 in
 
+# Text others control (an issue's, a comment's or a pull request's, in
+# `github.event.*` and `github.head_ref`; a caller's or dispatcher's
+# `inputs`; another job's `needs.*.outputs`, which may come from its
+# sandbox) must not be spliced into a privileged step's script: Actions
+# expands `${{ }}` in `run:`, and github-script evaluates its `script:`, so
+# that would be code execution as runner. In `env:` it stays data, as long
+# as the script doesn't expand that env value again. Numbers and ids from
+# the event are allowed. A lint on the expression text, like the secrets
+# check (#25).
+let UNTRUSTED_TEXT_RE = "(?i)\\bgithub\\s*(\\.\\s*(event|head_ref)\\b|\\.\\s*\\*|\\[|[,)}]|$)|\\binputs\\b|\\bneeds\\s*(\\.\\s*[A-Za-z0-9_*-]+\\s*(\\.\\s*outputs\\b|\\[)|\\[|\\.\\s*\\*|[,)}]|$)" in
+let SAFE_EVENT_RE = "(?i)\\bgithub\\s*\\.\\s*event(\\s*\\.\\s*[A-Za-z_][A-Za-z0-9_]*)*\\s*\\.\\s*(number|id)\\b" in
+let untrusted_expression = fun e => std.string.is_match UNTRUSTED_TEXT_RE (std.string.replace_regex SAFE_EVENT_RE "0" e) in
+let has_untrusted_text = fun s => std.is_string s && std.array.any untrusted_expression (expressions s) in
+# The step's env names whose values hold such text, and whether an
+# expression expands one of them (or all of `env`) again.
+let tainted_env = fun step =>
+  if std.record.has_field "env" step then
+    std.array.filter (fun n => has_untrusted_text step.env."%{n}") (std.record.fields step.env)
+  else
+    []
+in
+let expands_env = fun names e =>
+  names != []
+  && (std.string.is_match "(?i)\\benv\\s*(\\[|\\.\\s*\\*|[,)}]|$)" e
+    || std.array.any (fun n => std.string.is_match "(?i)\\benv\\s*\\.\\s*%{n}\\b" e) names)
+in
+# The strings of a privileged step that are code: its `run`, and in
+# `with`, github-script's `script` or, for a publish step (which reads
+# only staged data otherwise), every value.
+let script_strings = fun all_with step =>
+  (if std.record.has_field "run" step then [step.run] else [])
+  @ (
+    if !(std.record.has_field "with" step) then
+      []
+    else if all_with then
+      std.record.values step.with
+    else if std.record.has_field "script" step.with then
+      [step.with.script]
+    else
+      []
+  )
+in
+let NoUntrustedTextInScript = fun all_with => validator
+  (fun step =>
+    let tainted = tainted_env step in
+    !(std.array.any
+      (fun s => has_untrusted_text s || (std.is_string s && std.array.any (expands_env tainted) (expressions s)))
+      (script_strings all_with step)))
+  (fun _step => "a privileged step's script can't expand text others control (`github.event`, `github.head_ref`, `inputs`, `needs.*.outputs`, or an env value holding them): whoever wrote it would be writing code that runs as runner; pass it in `env:` and use the shell variable")
+in
+
 # checkout leaves the job's token in .git/config unless told not to, and
 # the hand-off would give it to the sandbox (it also refuses such a copy).
 let NoPersistedCredentials = validator
@@ -109,6 +165,7 @@ let RunnerStep = std.contract.Sequence [
   },
   OneOfRunUses,
   NoPersistedCredentials,
+  NoUntrustedTextInScript false,
 ] in
 
 # A `share` runner step publishes a file or directory tree from the
@@ -221,7 +278,7 @@ let uses_sandbox_outputs = fun publish_ids s =>
       || std.array.any
         (fun m => !(std.array.elem (std.string.lowercase (std.array.first m.groups)) publish_ids))
         (std.string.find_all STEP_OUTPUTS_RE expr))
-    (std.array.drop_first (std.string.split "${{" s))
+    (expressions s)
 in
 let step_strings = fun step =>
   (if std.record.has_field "run" step then [step.run] else [])
@@ -250,6 +307,7 @@ let PublishStep = fun publish_ids => std.contract.Sequence [
   },
   OneOfRunUses,
   NoSandboxOutputs publish_ids,
+  NoUntrustedTextInScript true,
 ] in
 
 let Sandbox = {
