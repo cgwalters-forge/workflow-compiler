@@ -97,6 +97,17 @@ cargo run -- check    # fail on a stale lock file or an accepted reject test
 cargo test            # wfc's own tests, and `check` of this repository
 ```
 
+wfc reads and writes the repository only through a directory fd for its
+root (cap-std), and reads only what a compile needs (`READABLE` in
+`src/repo.rs`: the compiler's library and runtime, the sources, the tests
+and what `check` compares with; not `.git` or the rest of the checkout),
+following no symlinks. nickel would resolve an `import` against any path
+(`/etc/passwd`, `../x`, a symlink out of the tree) and has no hook to read
+through a directory fd, so wfc never gives it a path: it reads a source's
+imports itself, transitively, and hands nickel their text. Stronger
+isolation (no network, a read-only mount of the checkout) is up to what
+runs wfc.
+
 `nickel-lang-core` is outside nickel's 1.0 stability promise, so
 `Cargo.toml` pins it exactly; a bump can change the lock files, so it
 goes with `cargo run -- compile`. wfc builds with the toolchain in

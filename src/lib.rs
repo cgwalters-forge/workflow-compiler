@@ -1,13 +1,17 @@
 //! The workflow compiler: evaluates the nickel workflow sources in
 //! `workflows/` (which call `lib/gha.ncl`'s `compile`) in-process with
 //! `nickel-lang-core`, and writes or checks their lock files in
-//! `.github/workflows/`.
+//! `.github/workflows/`. Everything it reads and writes goes through the
+//! repository's directory fd ([`repo`]).
 
 pub mod nickel;
+pub mod repo;
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+
+use crate::repo::Repo;
 
 /// Where workflow sources live, relative to the repository root.
 pub const SOURCES_DIR: &str = "workflows";
@@ -45,34 +49,6 @@ pub fn lock_path(source: &str) -> String {
         .unwrap_or(source)
         .trim_end_matches(".ncl");
     format!("{LOCKS_DIR}/{stem}.lock.yml")
-}
-
-/// The `.ncl` files in `root/dir`, relative to `root` and sorted; none if
-/// it doesn't exist.
-fn ncl_files(root: &Path, dir: &str) -> Result<Vec<String>> {
-    let entries = match std::fs::read_dir(root.join(dir)) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {dir}")),
-    };
-    let mut files = Vec::new();
-    for entry in entries {
-        let name = entry.with_context(|| format!("reading {dir}"))?.file_name();
-        if let Some(name) = name.to_str().filter(|n| n.ends_with(".ncl")) {
-            files.push(format!("{dir}/{name}"));
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-/// `root/rel`, or `None` if it doesn't exist.
-fn read_optional(root: &Path, rel: &str) -> Result<Option<String>> {
-    match std::fs::read_to_string(root.join(rel)) {
-        Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {rel}")),
-    }
 }
 
 /// Where two texts first differ: the 1-based line number and both lines.
@@ -121,24 +97,22 @@ fn stale(path: &str, source: &str, committed: Option<&str>, compiled: &str) -> O
 /// Compiles or checks the repository at `root`, returning the problems
 /// found.
 pub fn run(root: &Path, mode: Mode) -> Result<Vec<String>> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("resolving {}", root.display()))?;
+    let repo = Repo::open(root)?;
     match mode {
-        Mode::Check => check(&root),
-        Mode::Compile => compile(&root),
+        Mode::Check => check(&repo),
+        Mode::Compile => compile(&repo),
     }
 }
 
-fn check(root: &Path) -> Result<Vec<String>> {
+fn check(root: &Repo) -> Result<Vec<String>> {
     let mut problems = Vec::new();
-    let sources = ncl_files(root, SOURCES_DIR)?;
+    let sources = root.list(SOURCES_DIR, ".ncl")?;
     for source in &sources {
         let path = lock_path(source);
         match nickel::export_yaml(root, source) {
             Err(e) => problems.push(format!("{e:#}")),
             Ok(yaml) => {
-                let committed = read_optional(root, &path)?;
+                let committed = root.read(&path)?;
                 problems.extend(stale(
                     &path,
                     source,
@@ -148,10 +122,9 @@ fn check(root: &Path) -> Result<Vec<String>> {
             }
         }
     }
-    let rejects = ncl_files(root, REJECT_DIR)?;
+    let rejects = root.list(REJECT_DIR, ".ncl")?;
     for source in &rejects {
-        let text = std::fs::read_to_string(root.join(source))
-            .with_context(|| format!("reading {source}"))?;
+        let text = root.read(source)?.unwrap_or_default();
         let Some(expect) = text.lines().find_map(|l| l.strip_prefix(EXPECT)) else {
             problems.push(format!("{source} has no \"{EXPECT}\" line"));
             continue;
@@ -185,9 +158,9 @@ struct Pass {
 }
 
 /// Compiles every source, writing nothing.
-fn compile_pass(root: &Path) -> Result<Pass> {
+fn compile_pass(root: &Repo) -> Result<Pass> {
     let mut pass = Pass::default();
-    for source in ncl_files(root, SOURCES_DIR)? {
+    for source in root.list(SOURCES_DIR, ".ncl")? {
         match nickel::export_yaml(root, &source) {
             Ok(yaml) => pass
                 .outputs
@@ -199,17 +172,17 @@ fn compile_pass(root: &Path) -> Result<Pass> {
 }
 
 /// Writes each of `outputs` that changed.
-fn write_outputs(root: &Path, outputs: &[(String, String)]) -> Result<()> {
+fn write_outputs(root: &Repo, outputs: &[(String, String)]) -> Result<()> {
     for (rel, text) in outputs {
-        if read_optional(root, rel)?.as_deref() != Some(text.as_str()) {
-            std::fs::write(root.join(rel), text).with_context(|| format!("writing {rel}"))?;
+        if root.read(rel)?.as_deref() != Some(text.as_str()) {
+            root.write(rel, text)?;
             eprintln!("wrote {rel}");
         }
     }
     Ok(())
 }
 
-fn compile(root: &Path) -> Result<Vec<String>> {
+fn compile(root: &Repo) -> Result<Vec<String>> {
     let pass = compile_pass(root)?;
     write_outputs(root, &pass.outputs)?;
     Ok(pass.problems)
