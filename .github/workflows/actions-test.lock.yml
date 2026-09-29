@@ -23,6 +23,13 @@ jobs:
               },
               "repo": "actions/setup-node",
               "sha": "820762786026740c76f36085b0efc47a31fe5020"
+            },
+            {
+              "files": {
+                "action.yml": "199f8092e219b553279f3aa76ee5f7c2a6bc3e72ce6fe816a7b60bb8b100226d"
+              },
+              "repo": "crate-ci/typos",
+              "sha": "00f422f3b19c57bc6338715ebfe3316d38768461"
             }
           ]
       name: Fetch the sandbox's actions (generated)
@@ -1112,6 +1119,59 @@ jobs:
         }
       shell: /usr/local/bin/runner-sandbox-exec --action {0}
     - env:
+        INPUT_CONFIG: ${{ ('') }}
+        INPUT_EXTEND_IDENTIFIERS: ${{ ('') }}
+        INPUT_EXTEND_WORDS: ${{ ('') }}
+        INPUT_FILES: ${{ ('LICENSE-MIT') }}
+        INPUT_ISOLATED: ${{ ('false') }}
+        INPUT_WRITE_CHANGES: ${{ ('false') }}
+        INSTALL_DIR: ${{ '/var/lib/runner-sandbox/temp' }}
+        RUNNER_SANDBOX_ENV: INPUT_CONFIG,INPUT_EXTEND_IDENTIFIERS,INPUT_EXTEND_WORDS,INPUT_FILES,INPUT_ISOLATED,INPUT_WRITE_CHANGES,INSTALL_DIR
+      id: action-2__typos
+      if: (success()) && (success())
+      name: Run crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 step 1 (sandboxed)
+      run: $GITHUB_ACTION_PATH/action/entrypoint.sh
+      shell: /usr/local/bin/runner-sandbox-exec --action-path crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 {0}
+    - env:
+        OUTCOME_0: ${{ steps.action-2__typos.outcome }}
+        RUNNER_SANDBOX_ENV: OUTCOME_0
+      id: action-2
+      if: '!cancelled() && (success())'
+      name: Finish crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 (generated)
+      run: |-
+        test "$OUTCOME_0" != failure
+        delim=ghadelimiter_$(cat /proc/sys/kernel/random/uuid)
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - name: Write a misspelled file
+      run: echo "This is teh wrong spelling." >misspelled.txt
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - continue-on-error: true
+      env:
+        INPUT_CONFIG: ${{ ('') }}
+        INPUT_EXTEND_IDENTIFIERS: ${{ ('') }}
+        INPUT_EXTEND_WORDS: ${{ ('') }}
+        INPUT_FILES: ${{ ('misspelled.txt') }}
+        INPUT_ISOLATED: ${{ ('false') }}
+        INPUT_WRITE_CHANGES: ${{ ('false') }}
+        INSTALL_DIR: ${{ '/var/lib/runner-sandbox/temp' }}
+        RUNNER_SANDBOX_ENV: INPUT_CONFIG,INPUT_EXTEND_IDENTIFIERS,INPUT_EXTEND_WORDS,INPUT_FILES,INPUT_ISOLATED,INPUT_WRITE_CHANGES,INSTALL_DIR
+      id: typo__typos
+      if: (success()) && (success())
+      name: Run crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 step 1 (sandboxed)
+      run: $GITHUB_ACTION_PATH/action/entrypoint.sh
+      shell: /usr/local/bin/runner-sandbox-exec --action-path crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 {0}
+    - continue-on-error: true
+      env:
+        OUTCOME_0: ${{ steps.typo__typos.outcome }}
+        RUNNER_SANDBOX_ENV: OUTCOME_0
+      id: typo
+      if: '!cancelled() && (success())'
+      name: Finish crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461 (generated)
+      run: |-
+        test "$OUTCOME_0" != failure
+        delim=ghadelimiter_$(cat /proc/sys/kernel/random/uuid)
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - env:
         RUNNER_SANDBOX_ENV: VERSION
         VERSION: ${{ steps.node.outputs.node-version }}
       name: setup-node's PATH and outputs reach later sandboxed steps
@@ -1155,9 +1215,10 @@ jobs:
     - env:
         DENIED: ${{ steps.denied-env.outcome }}
         HEREDOC: ${{ steps.bad-heredoc.outcome }}
-        RUNNER_SANDBOX_ENV: DENIED,HEREDOC
+        RUNNER_SANDBOX_ENV: DENIED,HEREDOC,TYPO
+        TYPO: ${{ steps.typo.outcome }}
       name: Both failed
-      run: test "$DENIED $HEREDOC" = "failure failure"
+      run: test "$DENIED $HEREDOC $TYPO" = "failure failure failure"
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - env:
         INPUT_CHECK-LATEST: 'false'

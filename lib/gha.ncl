@@ -515,7 +515,35 @@ let CREDENTIALED_ACTIONS = [
 # `main` in its place, `post` after the last sandboxed step, and `fetch`
 # the actions the fetch step must get. KEY is the step's id, generated if
 # it has none, which links the post step to the main one's state.
-let action_steps = fun key step =>
+# A step's condition as an expression, `success()` when it has none.
+let condition = fun step =>
+  if std.record.has_field "if" step then
+    let raw = std.string.trim step."if" in
+    if std.string.is_match "^\\$\\{\\{.*\\}\\}$" raw then std.string.trim (std.string.substring 3 (std.string.length raw - 2) raw) else raw
+  else
+    "success()"
+in
+
+# An input's value as an expression for a composite action's steps, in
+# which `inputs.NAME` is replaced by it: a string literal, or the one
+# expression the value is.
+let input_expression = fun ref name value =>
+  let trimmed = std.string.trim value in
+  if !(std.string.contains "${{" value) then
+    "'%{std.string.replace "'" "''" value}'"
+  else if std.string.is_match "^\\$\\{\\{(?s:.)*\\}\\}$" trimmed
+    && std.array.length (std.string.split "${{" trimmed) == 2
+    && std.array.length (std.string.split "}}" trimmed) == 2 then
+    std.string.trim (std.string.substring 3 (std.string.length trimmed - 2) trimmed)
+  else
+    std.fail_with "input `%{name}` of `%{ref}` mixes text and expressions, which the compiler can't pass into a composite action's steps"
+in
+
+# F applied to S as an expression: to each `${{ }}` in it, or to all of it
+# for an `if:` without them.
+let map_condition = fun f s => if std.string.contains "${{" s then map_exprs f s else f s in
+
+let rec action_steps = fun key step =>
   let ref = step.uses in
   let meta = (action_meta ref).metadata in
   let runs = meta.runs in
@@ -559,6 +587,125 @@ let action_steps = fun key step =>
             [],
         fetch = fetched,
       }
+  else if using == "composite" then
+    # Expanded here, each of its steps a sandboxed step of this job: its
+    # `run:` steps get GITHUB_ACTION_PATH from the wrapper, its `uses:`
+    # steps go through the shim in turn, and `inputs.X`, `github.action_path`
+    # and step ids in its expressions are rewritten for the caller's job.
+    let inputs = if std.record.has_field "inputs" meta && meta.inputs != null then meta.inputs else {} in
+    let value_of = fun name =>
+      if std.record.has_field name with then
+        with."%{name}"
+      else
+        let i = inputs."%{name}" in
+        if std.is_record i && std.record.has_field "default" i then
+          (if std.is_string i.default then (if mentions_credentials i.default then "" else i.default) else std.to_string i.default)
+        else
+          ""
+    in
+    let replacements =
+      std.array.map
+        (fun name => { re = "(?i)\\binputs\\s*\\.\\s*%{name}\\b", by = "(%{input_expression ref name (value_of name)})" })
+        (std.record.fields inputs)
+      @ [{ re = "(?i)\\bgithub\\s*\\.\\s*action_path\\b", by = "'%{action_dir ref}'" }]
+    in
+    let rewrite_expr = fun e =>
+      let e1 = std.array.fold_left (fun acc r => std.string.replace_regex r.re (std.string.replace "$" "$$" r.by) acc) e replacements in
+      let e2 = std.string.replace_regex "(?i)\\bsteps\\s*\\.\\s*([A-Za-z0-9_-]+)" "steps.%{key}__$1" e1 in
+      let e3 = std.array.fold_left (fun acc c => std.string.replace_regex c.re "'%{c.path}'" acc) e2 SANDBOX_CONTEXTS in
+      if std.string.is_match "(?i)\\binputs\\b" e3 then
+        std.fail_with "a step of `%{ref}` uses `inputs` in a way the compiler can't expand: %{e}"
+      else
+        e3
+    in
+    # The expanded steps are sandboxed, so like the source's own they may
+    # not name the job's token or secrets.
+    let rewrite = fun str =>
+      let out = map_exprs rewrite_expr str in
+      if mentions_credentials out then
+        std.fail_with "a step of `%{ref}` references secrets or github.token, which the sandbox doesn't have"
+      else
+        out
+    in
+    let rewrite_record = fun r => std.record.map (fun _k v => if std.is_string v then rewrite v else v) r in
+    let outer_if = condition step in
+    let inner_steps = if std.record.has_field "steps" runs then runs.steps else [] in
+    let inner_key_of = fun i =>
+      let inner = std.array.at i inner_steps in
+      "%{key}__%{if std.record.has_field "id" inner then inner.id else std.to_string i}"
+    in
+    let expanded =
+      std.array.generate
+        (fun i =>
+          let inner = std.array.at i inner_steps in
+          let inner_key = inner_key_of i in
+          # A composite action stops at its first failing step.
+          let earlier_ok = std.array.generate (fun j => " && steps.%{inner_key_of j}.outcome != 'failure'") i in
+          let cond = "(%{outer_if}) && (%{map_condition rewrite_expr (condition inner)})%{std.string.join "" earlier_ok}" in
+          let shared =
+            { "if" = cond, id = inner_key }
+            & (if std.record.has_field "name" inner then { name = rewrite inner.name } else {})
+            & std.record.filter (fun n _v => std.array.elem n ["continue-on-error", "timeout-minutes"]) step
+          in
+          if std.record.has_field "working-directory" inner then
+            std.fail_with "a step of `%{ref}` sets `working-directory`, which sandboxed steps can't"
+          else if std.record.has_field "uses" inner then
+            action_steps inner_key (
+              { uses = inner.uses | Pinned }
+              & shared
+              & (if std.record.has_field "with" inner then { with = rewrite_record inner.with } else {})
+              & (if std.record.has_field "env" inner || user_env != {} then { env = user_env & (if std.record.has_field "env" inner then rewrite_record inner.env else {}) } else {})
+            )
+          else if !(std.record.has_field "shell" inner) || !(std.array.elem inner.shell ["bash", "sh"]) then
+            std.fail_with "a step of `%{ref}` runs with shell `%{if std.record.has_field "shell" inner then inner.shell else "(none)"}`; sandboxed composite steps run with bash"
+          else
+            {
+              main = [
+                shared
+                & {
+                  name | default = "Run %{ref} step %{std.to_string (i + 1)} (sandboxed)",
+                  shell = "%{EXEC} --action-path %{ref} {0}",
+                  run = rewrite inner.run,
+                  env = with_env_list (std.array.fold_left (fun acc f => std.record.update f user_env."%{f}" acc) (if std.record.has_field "env" inner then rewrite_record inner.env else {}) (std.record.fields user_env)),
+                }
+              ],
+              post = [],
+              fetch = [],
+            })
+        (std.array.length inner_steps)
+    in
+    # The step that stands for the whole action, with its id: it fails if
+    # one of the action's steps failed, and sets the action's outputs.
+    let outputs = if std.record.has_field "outputs" meta && meta.outputs != null then meta.outputs else {} in
+    let output_names = std.record.fields outputs in
+    let n_inner = std.array.length inner_steps in
+    let outputs_step = [
+      std.record.filter (fun n _v => std.array.elem n ["continue-on-error"]) step
+      & {
+        name = "Finish %{ref} (generated)",
+        id = key,
+        "if" = "!cancelled() && (%{outer_if})",
+        shell = "%{EXEC} {0}",
+        env =
+          with_env_list (
+            std.array.fold_left (fun acc i => std.record.insert "OUTCOME_%{std.to_string i}" "${{ steps.%{inner_key_of i}.outcome }}" acc) {} (std.array.generate (fun i => i) n_inner)
+            & std.array.fold_left (fun acc i => std.record.insert "OUTPUT_%{std.to_string i}" (rewrite outputs."%{std.array.at i output_names}".value) acc) {} (std.array.generate (fun i => i) (std.array.length output_names))
+          ),
+        run =
+          std.string.join "\n" (
+            std.array.generate (fun i => "test \"$OUTCOME_%{std.to_string i}\" != failure") n_inner
+            @ ["delim=ghadelimiter_$(cat /proc/sys/kernel/random/uuid)"]
+            @ std.array.generate
+              (fun i => "printf '%s<<%s\\n%s\\n%s\\n' %{std.array.at i output_names} \"$delim\" \"$OUTPUT_%{std.to_string i}\" \"$delim\" >>\"$GITHUB_OUTPUT\"")
+              (std.array.length output_names)
+          ),
+      }
+    ] in
+    {
+      main = std.array.flat_map (fun e => e.main) expanded @ outputs_step,
+      post = std.array.flat_map (fun e => e.post) expanded,
+      fetch = fetched @ std.array.flat_map (fun e => e.fetch) expanded,
+    }
   else if using == "docker" then
     std.fail_with "`%{ref}` is a Docker action, which can't run in the sandbox (no container engine as root); run the tool in a `run:` step with rootless podman instead"
   else

@@ -393,7 +393,7 @@ composite action is expanded into its steps at compile time, so each of
 them lands in the phase the composite was used in.
 
 **Status:** partial. Pinning holds, nothing runs as runner in the middle
-of `steps`, and the shim runs JavaScript actions there; the
+of `steps`, and the shim runs JavaScript and composite actions there; the
 [README](../README.md#actions-in-the-sandbox) lists the actions it can't
 run, which are compile errors. The fetch step checks each action's
 `action.yml` against the sha256 in `actions.lock.json`, so the metadata
@@ -407,9 +407,9 @@ Post-steps of setup actions run as runner at the end of the job
 
 **Proof:** `tests/reject/unpinned-action.ncl`,
 `tests/reject/credentialed-action-in-steps.ncl`; `workflows/actions-test.ncl`
-on hosted ubuntu-26.04, which runs DavidAnson/markdownlint-cli2-action
-and actions/setup-node (into the sandbox's tool cache, with its post
-step).
+on hosted ubuntu-26.04, which runs DavidAnson/markdownlint-cli2-action,
+actions/setup-node (into the sandbox's tool cache, with its post step) and
+the composite crate-ci/typos, which must also fail on a misspelled file.
 
 ### R10. What the guarantee depends on
 
