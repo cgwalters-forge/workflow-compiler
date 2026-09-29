@@ -139,9 +139,7 @@ artifacts.
 
 A compiled job always has the same shape. The source names three of the
 phases; the compiler generates the rest, and nothing in the source can
-reorder them. The proof of concept in #12 has the first four and runs its
-allowlisted actions (upload-artifact) as runner in the middle of `steps`;
-the seal and `publish_steps` are planned
+reorder them. All six exist; actions in `steps` wait for the shim
 ([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)).
 
 ```text
@@ -200,10 +198,7 @@ a step's `shell:` or `working-directory`, a job's `container:`, `defaults`
 or `services`, workflow- or job-level `env:`, and a `uses:` in `steps` that
 the shim can't run.
 
-**Status:** partial. In #12, actions in `sandbox.allowed_actions` and the
-generated upload-artifact step run as runner in the middle of `steps`;
-[#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16) moves
-them to `publish_steps`.
+**Status:** holds, with the gap below.
 
 **Proof:** the reject tests in `tests/reject/` (`shell-override`,
 `working-directory`, `job-container`, `job-defaults`, and the others), which
@@ -227,7 +222,8 @@ the environment the source gave the step (plus a fixed list of non-secret
 
 **Proof:** `workflows/sandbox-test.ncl` on hosted ubuntu-26.04, steps "Runs
 as the sandbox user", "Runs in a login session of its own", "sudo is
-refused" and "The sudo step failed". The private `/tmp` isn't tested.
+refused", "The sudo step failed", and "Each step gets a private /tmp and
+/var/tmp".
 
 ### R3. The sandbox holds no credentials
 
@@ -273,14 +269,16 @@ in `publish_steps` holds the job's tokens but can't become root, and with
 Yama's `ptrace_scope` at 1 (set by the secure-host step) it can't read
 `Runner.Worker`'s memory either.
 
-**Status:** holds with the default. The source can turn the lock off, and
-the `ptrace_scope` part isn't tested
+**Status:** holds. The source can turn the lock off only for a job
+without `publish_steps`, where no runner code runs after the sandbox
 ([#32](https://github.com/cgwalters-forge/workflow-compiler/issues/32)); the
 remaining rule depends on sudo and sudo-rs agreeing on sudoers semantics
 ([#9](https://github.com/cgwalters-forge/workflow-compiler/issues/9)).
 
 **Proof:** the enter step's own fail-closed check, in every compiled job;
-its log shows `sudo -l -U runner`.
+its log shows `sudo -l -U runner`. `sandbox-test`'s publish step "The
+sandbox is sealed" checks that runner has no sudo and can't open
+`/proc/<Runner.Worker>/mem`; `tests/reject/publish-without-sudo-lock.ncl`.
 
 ### R5. Nothing outlives its step
 
@@ -289,19 +287,19 @@ gone before anything reads what it wrote, and before the next step starts.
 The sandbox user can't start processes outside a step: cron, at and
 lingering are denied to it, as is every polkit action.
 
-**Status:** partial. The wrapper stops the sandbox's processes after each
-step and before the next, so a step killed by its timeout or a cancel
-leaves processes running until the next sandboxed step starts; after the
-last one, they run next to the steps that follow, until the seal
-([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16))
-stops them. This assumes an ephemeral runner: the enter step refuses a
-runner that already has the sandbox's directory, but a persistent runner
-would still carry the sandbox user's own files and processes over into the
-next job ([#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28)).
+**Status:** holds on an ephemeral runner. The wrapper stops the sandbox's
+processes after each step and before the next, and the seal after the last
+one, so a step killed by its timeout or a cancel leaves processes running
+at most until the next sandboxed step or the seal. This assumes an
+ephemeral runner: the enter step refuses a runner that already has the
+sandbox's directory, but a persistent runner would still carry the sandbox
+user's own files and processes over into the next job
+([#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28)).
 
 **Proof:** `sandbox-test` steps "Leave a process behind", "Leave a process
 behind and time out", "Cron, at and lingering are denied" and "The escapes
-failed".
+failed"; the publish step "The sandbox is sealed", which fails if a
+sandbox process survived the seal.
 
 ### R6. Instructions the sandbox can trust come only from shares
 
@@ -344,7 +342,7 @@ workflow commands, so a step can still use `::set-output` or `::add-mask::`
 Staged outputs have no size cap
 ([#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18)),
 and files the sandbox leaves in `/dev/shm` or its workspace stay readable
-to runner until the seal.
+to runner until the seal, which hides or removes them.
 
 **Proof:** `sandbox-test` steps "Write a step output", "Read it back",
 "Point GITHUB_OUTPUT at a root-only file" and "Smuggle a multi-line output"
@@ -356,24 +354,34 @@ to runner until the seal.
 
 `publish_steps` are the only steps after the enter step that run as
 runner. Before they start, the seal step stops every sandbox process and
-makes the sandbox's workspace, home and leftovers in shared temporary
-directories unreadable to runner, so a publish step can only read what the
-sandbox staged. If the seal fails, no publish step runs. The compiler
-rejects expressions in a publish step's `run`, `with` or `env` that use a
-sandboxed step's outputs, since those are strings the sandbox chose. A
+makes the sandbox's workspace and home unreadable to runner, and removes
+what the sandbox left in world-writable directories (found on every
+mounted filesystem but the kernel's own; the seal fails if it can't
+search one), owned by its uid or gid or by
+the subordinate ids rootless podman maps its containers to. So a publish
+step can only read what the sandbox staged. If the seal fails, no publish
+step runs. The compiler rejects expressions in a publish step's `run`,
+`working-directory`, `with` or `env` that use a sandboxed step's outputs,
+since those are strings the sandbox chose. A
 step's `outcome` and `conclusion` are allowed: they are one of four fixed
 values, so the most the sandbox can do with them (by its exit status) is
 decide whether a publish step runs, which it can do anyway.
 
-**Status:** planned
-([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16),
-which also settles
-[#1](https://github.com/cgwalters-forge/workflow-compiler/issues/1)).
+**Status:** holds for files the sandbox's ids own (and settles
+[#1](https://github.com/cgwalters-forge/workflow-compiler/issues/1)). The
+outputs check is a lint, like R11. A publish step can still reach what the
+sandbox can reach over local IPC or the network
+([#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27)).
 
-**Proof:** none yet. It needs reject tests for sandbox outputs in publish
-steps, in the spellings the secrets lint covers (`steps['x']`,
-`toJSON(steps)`), and a runtime test in which a publish step tries to read
-the sandbox's workspace, home and leftovers.
+**Proof:** `tests/reject/publish-sandbox-output-*.ncl` (outputs in `run`,
+`working-directory`, `with` and `env`, `toJSON(steps)`, `steps['x']`,
+`steps.*` filters) and `publish-if-unbalanced.ncl`; `sandbox-test`'s
+publish steps "Read the staged report, as runner" and "The sandbox is
+sealed", which fail if a publish step can read the sandbox's workspace, its
+home, or files it left in `/dev/shm` (one owned by a subordinate uid, made
+with `podman unshare chown`), or if the wrapper still accepts a request
+after the seal. Every publish step's condition includes the seal's
+success, which the lock files show.
 
 ### R9. Every action is pinned and runs in the phase its class allows
 
@@ -384,9 +392,10 @@ middle of the sandbox. In `publish_steps` any pinned action may run. A
 composite action is expanded into its steps at compile time, so each of
 them lands in the phase the composite was used in.
 
-**Status:** partial. Pinning holds. Actions in `sandbox.allowed_actions`
-still run as runner in `steps`, and the shim is planned
-([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)).
+**Status:** partial. Pinning holds, and nothing runs as runner in the
+middle of `steps` any more: until the shim
+([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)),
+`steps` takes no actions at all.
 A pin covers the action's own files, not a composite's nested `uses:`, a
 Docker image or what the action downloads, and GitHub resolves a SHA from
 anywhere in the repository's fork network
@@ -395,7 +404,7 @@ Post-steps of setup actions run as runner at the end of the job
 ([#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2)).
 
 **Proof:** `tests/reject/unpinned-action.ncl`,
-`tests/reject/action-not-allowed.ncl`.
+`tests/reject/action-in-steps.ncl`.
 
 ### R10. What the guarantee depends on
 

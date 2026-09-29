@@ -560,8 +560,10 @@ jobs:
           // the step's outputs and summary into the runner's own files, accepting only
           // plain name=value output lines.
           //
-          // `runner-sandbox-exec --collect NAME PATH` has the root side copy PATH
-          // out of the sandbox for a generated upload step instead.
+          // `runner-sandbox-exec --stage NAME PATH` has the root side copy PATH out
+          // of the sandbox for a generated stage step instead, and
+          // `runner-sandbox-exec --seal` has it seal the sandbox after the last
+          // sandboxed step.
           "use strict";
           const fs = require("node:fs");
           const crypto = require("node:crypto");
@@ -581,10 +583,10 @@ jobs:
             process.exit(125);
           }
 
-          const collect = process.argv[2] === "--collect";
-          const scriptPath = process.argv[2];
-          if (collect ? process.argv.length !== 5 : !scriptPath || process.argv.length !== 3) {
-            fail("usage: runner-sandbox-exec SCRIPT | --collect NAME PATH");
+          const mode = process.argv[2];
+          const argc = { "--stage": 5, "--seal": 3 }[mode] ?? 3;
+          if (!mode || process.argv.length !== argc || (mode.startsWith("--") && !["--stage", "--seal"].includes(mode))) {
+            fail("usage: runner-sandbox-exec SCRIPT | --stage NAME PATH | --seal");
           }
           const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
           const env = {};
@@ -592,9 +594,10 @@ jobs:
             if (process.env[name] !== undefined) env[name] = process.env[name];
           }
           const id = crypto.randomBytes(16).toString("hex");
-          const request = JSON.stringify(collect
-            ? { id, collect: { name: process.argv[3], path: process.argv[4] } }
-            : { id, script: fs.readFileSync(scriptPath, "utf8"), env });
+          const request = JSON.stringify(
+            mode === "--stage" ? { id, stage: { name: process.argv[3], path: process.argv[4] } }
+            : mode === "--seal" ? { id, seal: true }
+            : { id, script: fs.readFileSync(mode, "utf8"), env });
           // By absolute path: the step's own env: applies to this process.
           const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
           if (r.error) fail(`running ${RUN}: ${r.error.message}`);
@@ -819,10 +822,14 @@ jobs:
           // fields are validated, and the files the sandbox wrote are read without
           // following symlinks.
           //
-          // A request {id, collect: {name, path}} instead copies PATH from the
-          // sandbox's workspace to COLLECT_DIR/NAME, for a generated upload step:
-          // actions like upload-artifact run as runner and follow symlinks, so they
-          // must never read a path the sandbox controls.
+          // A request {id, stage: {name, path}} instead copies PATH from the
+          // sandbox's workspace to STAGED_DIR/NAME, for a generated stage step:
+          // publish steps run as runner, and actions like upload-artifact follow
+          // symlinks, so they must never read a path the sandbox controls.
+          //
+          // A request {id, seal: true}, from the generated step after the last
+          // sandboxed step, stops the sandbox's processes for good and makes its
+          // files unreadable to runner; every request after it is refused.
           "use strict";
           const fs = require("node:fs");
           const path = require("node:path");
@@ -831,7 +838,15 @@ jobs:
           const CONFIG = JSON.parse(fs.readFileSync("/etc/runner-sandbox/config.json", "utf8"));
           const STEPS_DIR = "/run/runner-sandbox/steps";
           const RESULTS_DIR = "/run/runner-sandbox/results";
-          const COLLECT_DIR = "/run/runner-sandbox/collect";
+          const STAGED_DIR = "/run/runner-sandbox/staged";
+          const SEALED = "/run/runner-sandbox/sealed";
+          // Filesystems not to look for world-writable directories on, where the
+          // sandbox can leave files that outlive its steps (its /tmp and /var/tmp
+          // are private to each step): kernel interfaces, not storage.
+          const KERNEL_FSTYPES = new Set([
+            "proc", "sysfs", "cgroup", "cgroup2", "devpts", "securityfs", "debugfs", "tracefs",
+            "bpf", "pstore", "configfs", "fusectl", "binfmt_misc", "efivarfs", "autofs", "nsfs",
+          ]);
           const MAX_FILE = 1 << 20;
           const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
           const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
@@ -877,12 +892,12 @@ jobs:
             }
           }
 
-          // Handles a collect request; the sandbox user has no process left, so
+          // Handles a stage request; the sandbox user has no process left, so
           // nothing changes the tree while it is copied.
-          function collect({ name, path: rel }) {
-            if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid upload name ${JSON.stringify(name)}`);
+          function stage({ name, path: rel }) {
+            if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid stage name ${JSON.stringify(name)}`);
             if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
-              throw new Error(`invalid upload path ${JSON.stringify(rel)}`);
+              throw new Error(`invalid stage path ${JSON.stringify(rel)}`);
             }
             const src = path.join(CONFIG.workdir, rel);
             let real;
@@ -892,7 +907,7 @@ jobs:
               throw new Error(`${rel}: ${e.code}`);
             }
             if (real !== src) throw new Error(`${rel} goes through a symlink`);
-            const dest = path.join(COLLECT_DIR, name);
+            const dest = path.join(STAGED_DIR, name);
             fs.rmSync(dest, { recursive: true, force: true });
             fs.mkdirSync(dest, { mode: 0o755 });
             try {
@@ -910,7 +925,7 @@ jobs:
             fail(`invalid request: ${e.message}`);
           }
           if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-          if (typeof req.script !== "string" && typeof req.collect !== "object") fail("missing script");
+          if (typeof req.script !== "string" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
           const env = req.env ?? {};
           for (const [k, v] of Object.entries(env)) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
@@ -930,17 +945,84 @@ jobs:
             return r.status === 0 ? null : `could not stop the sandbox user's processes (${r.error ?? `exit ${r.status}`})`;
           }
 
+          // The ids the sandbox's files can have: its own, and the subordinate ids
+          // rootless podman maps its containers to (`podman unshare chown 1:1 f`
+          // makes a file owned by one of them).
+          function sandboxIds(file, id) {
+            const ranges = [[id, 1]];
+            const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+            for (const line of text.split("\n")) {
+              const [owner, start, count] = line.split(":");
+              if (owner === CONFIG.user || owner === String(id)) ranges.push([Number(start), Number(count)]);
+            }
+            return (n) => ranges.some(([start, count]) => n >= start && n < start + count);
+          }
+
+          // World-writable directories (sticky or not) on every mounted filesystem
+          // but the kernel's own. Throws if one can't be searched: a seal that
+          // misses a directory would leave its files to runner.
+          function worldWritableDirs() {
+            const mounts = fs.readFileSync("/proc/self/mounts", "utf8").split("\n")
+              .map((l) => l.split(" "))
+              .filter((f) => f.length > 2 && !KERNEL_FSTYPES.has(f[2]))
+              .map((f) => f[1].replace(/\\040/g, " "));
+            const dirs = new Set();
+            for (const top of new Set(["/", ...mounts])) {
+              const r = spawnSync("find", [top, "-xdev", "-type", "d", "-perm", "-0002", "-print0"], { encoding: "utf8", maxBuffer: 1 << 28, stdio: ["ignore", "pipe", "pipe"] });
+              // Entries that vanish during the search (a process's /run files) are
+              // not a reason to fail; anything else, or a truncated output, is.
+              const problems = (r.stderr ?? "").split("\n").filter((l) => l && !l.endsWith("No such file or directory"));
+              if (r.error || r.signal || (r.status !== 0 && problems.length)) {
+                throw new Error(`searching ${top} for world-writable directories failed (${r.error?.message ?? r.signal ?? problems.join("; ").slice(0, 300)})`);
+              }
+              for (const d of r.stdout.split("\0").filter(Boolean)) dirs.add(d);
+            }
+            return [...dirs];
+          }
+
+          // Stops the sandbox for good: its processes, and runner's access to
+          // whatever it left behind, so publish steps can only read staged outputs.
+          function seal() {
+            fs.writeFileSync(SEALED, "", { mode: 0o644 });
+            // /var/lib/runner-sandbox (root's) holds the workspace; the home is the
+            // sandbox user's.
+            for (const dir of [path.dirname(CONFIG.workdir), CONFIG.home]) fs.chmodSync(dir, 0o700);
+            const isUid = sandboxIds("/etc/subuid", CONFIG.uid);
+            const isGid = sandboxIds("/etc/subgid", CONFIG.gid);
+            const removed = [];
+            for (const dir of worldWritableDirs()) {
+              for (const entry of fs.readdirSync(dir)) {
+                const p = path.join(dir, entry);
+                const st = fs.lstatSync(p, { throwIfNoEntry: false });
+                if (st && (isUid(st.uid) || isGid(st.gid))) {
+                  fs.rmSync(p, { recursive: true, force: true });
+                  removed.push(p);
+                }
+              }
+            }
+            console.log(`Sealed the sandbox${removed.length ? `; removed what it left in ${removed.join(", ")}` : ""}`);
+          }
+
+          function writeResult(result) {
+            fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+          }
+
           const user = CONFIG.user;
+          if (fs.existsSync(SEALED)) {
+            writeResult({ status: 125, error: "the sandbox is sealed: no sandboxed step can run after the seal step" });
+            process.exit(125);
+          }
           const stopError = stopSandboxProcesses();
           if (stopError) fail(stopError);
-          if (req.collect) {
+          if (req.stage || req.seal) {
             let result = { status: 0, output: "", summary: "" };
             try {
-              collect(req.collect);
+              if (req.stage) stage(req.stage);
+              else seal();
             } catch (e) {
-              result = { status: 1, error: `upload: ${e.message}` };
+              result = { status: 1, error: `${req.stage ? "stage" : "seal"}: ${e.message}` };
             }
-            fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+            writeResult(result);
             process.exit(result.status);
           }
           const stepDir = path.join(STEPS_DIR, req.id);
@@ -990,7 +1072,7 @@ jobs:
             result = { status: 125, error: e.message };
           }
           fs.rmSync(stepDir, { recursive: true, force: true });
-          fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+          writeResult(result);
           process.exit(status);
       name: Enter the sandbox (generated)
       run: |
@@ -1102,7 +1184,7 @@ jobs:
           fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
           fs.chmodSync(dest, 0o755);
         }
-        for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/collect"]) {
+        for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/staged"]) {
           fs.mkdirSync(d, { recursive: true, mode: 0o755 });
         }
 
@@ -1167,6 +1249,17 @@ jobs:
         loginctl show-session "$XDG_SESSION_ID" -p Name -p Class
         test "$(loginctl show-session "$XDG_SESSION_ID" -p Name --value)" = runner-sandbox
         if env | grep ^SUDO_; then echo "SUDO_* leaked into the sandbox"; exit 1; fi
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - name: Leave files in /tmp and /var/tmp
+      run: |-
+        echo left >/tmp/sandbox-tmp-marker
+        echo left >/var/tmp/sandbox-tmp-marker
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - name: Each step gets a private /tmp and /var/tmp
+      run: |-
+        for d in /tmp /var/tmp; do
+          if test -e "$d/sandbox-tmp-marker"; then echo "$d is shared between steps"; exit 1; fi
+        done
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - continue-on-error: true
       id: sudo
@@ -1278,76 +1371,123 @@ jobs:
         ln -s /proc/self/environ leak-dir/environ
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - continue-on-error: true
-      id: collect-leak-environ
-      name: Collect leak-environ for upload (generated)
-      run: /usr/local/bin/runner-sandbox-exec --collect leak-environ leak-environ
+      id: stage-leak-environ
+      name: Stage leak-environ as leak-environ (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage leak-environ leak-environ
       shell: bash
-    - if: '!cancelled() && steps.collect-leak-environ.outcome == ''success'''
-      name: Upload leak-environ (generated)
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        if-no-files-found: error
-        name: leak-environ
-        path: /run/runner-sandbox/collect/leak-environ
     - continue-on-error: true
-      id: collect-leak-runner
-      name: Collect leak-runner for upload (generated)
-      run: /usr/local/bin/runner-sandbox-exec --collect leak-runner leak-runner
+      id: stage-leak-runner
+      name: Stage leak-runner as leak-runner (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage leak-runner leak-runner
       shell: bash
-    - if: '!cancelled() && steps.collect-leak-runner.outcome == ''success'''
-      name: Upload leak-runner (generated)
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        if-no-files-found: error
-        name: leak-runner
-        path: /run/runner-sandbox/collect/leak-runner
     - continue-on-error: true
-      id: collect-leak-via
-      name: Collect leak-via/runner-secret.txt for upload (generated)
-      run: /usr/local/bin/runner-sandbox-exec --collect leak-via leak-via/runner-secret.txt
+      id: stage-leak-via
+      name: Stage leak-via/runner-secret.txt as leak-via (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage leak-via leak-via/runner-secret.txt
       shell: bash
-    - if: '!cancelled() && steps.collect-leak-via.outcome == ''success'''
-      name: Upload leak-via (generated)
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        if-no-files-found: error
-        name: leak-via
-        path: /run/runner-sandbox/collect/leak-via
     - continue-on-error: true
-      id: collect-leak-dir
-      name: Collect leak-dir for upload (generated)
-      run: /usr/local/bin/runner-sandbox-exec --collect leak-dir leak-dir
+      id: stage-leak-dir
+      name: Stage leak-dir as leak-dir (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage leak-dir leak-dir
       shell: bash
-    - if: '!cancelled() && steps.collect-leak-dir.outcome == ''success'''
-      name: Upload leak-dir (generated)
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        if-no-files-found: error
-        name: leak-dir
-        path: /run/runner-sandbox/collect/leak-dir
     - env:
-        DIR: ${{ steps.collect-leak-dir.outcome }}
-        ENVIRON: ${{ steps.collect-leak-environ.outcome }}
-        RUNNER: ${{ steps.collect-leak-runner.outcome }}
+        DIR: ${{ steps.stage-leak-dir.outcome }}
+        ENVIRON: ${{ steps.stage-leak-environ.outcome }}
+        RUNNER: ${{ steps.stage-leak-runner.outcome }}
         RUNNER_SANDBOX_ENV: DIR,ENVIRON,RUNNER,VIA
-        VIA: ${{ steps.collect-leak-via.outcome }}
+        VIA: ${{ steps.stage-leak-via.outcome }}
       name: Every upload through a symlink was refused
       run: |-
         echo "environ=$ENVIRON runner=$RUNNER via=$VIA dir=$DIR"
         test "$ENVIRON $RUNNER $VIA $DIR" = "failure failure failure failure"
       shell: /usr/local/bin/runner-sandbox-exec {0}
-    - id: collect-sandbox-test
+    - id: stage-sandbox-test
       if: always()
-      name: Collect hello.log for upload (generated)
-      run: /usr/local/bin/runner-sandbox-exec --collect sandbox-test hello.log
+      name: Stage hello.log as sandbox-test (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage sandbox-test hello.log
       shell: bash
-    - if: '!cancelled() && steps.collect-sandbox-test.outcome == ''success'''
+    - name: Write a report, and leave files where publish steps might look
+      run: |-
+        echo "report from $(id -un)" >report.txt
+        echo leftover >/dev/shm/sandbox-leftover
+        # One owned by a subordinate uid, through rootless podman.
+        podman unshare sh -c 'echo leftover >/dev/shm/subuid-leftover && chown 1:1 /dev/shm/subuid-leftover'
+        test "$(stat -c %u /dev/shm/subuid-leftover)" != "$(id -u)"
+        mkdir -p ~/private && echo secret-ish >~/private/notes
+      shell: /usr/local/bin/runner-sandbox-exec {0}
+    - id: stage-report
+      name: Stage report.txt as report (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage report report.txt
+      shell: bash
+    - id: runner-sandbox-seal
+      if: always()
+      name: Seal the sandbox (generated)
+      run: /usr/local/bin/runner-sandbox-exec --seal
+      shell: bash
+    - if: '!cancelled() && steps.stage-leak-environ.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
+      name: Upload leak-environ (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-environ
+        path: /run/runner-sandbox/staged/leak-environ
+    - if: '!cancelled() && steps.stage-leak-runner.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
+      name: Upload leak-runner (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-runner
+        path: /run/runner-sandbox/staged/leak-runner
+    - if: '!cancelled() && steps.stage-leak-via.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
+      name: Upload leak-via (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-via
+        path: /run/runner-sandbox/staged/leak-via
+    - if: '!cancelled() && steps.stage-leak-dir.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
+      name: Upload leak-dir (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: leak-dir
+        path: /run/runner-sandbox/staged/leak-dir
+    - if: '!cancelled() && steps.stage-sandbox-test.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
       name: Upload sandbox-test (generated)
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         if-no-files-found: error
         name: sandbox-test
-        path: /run/runner-sandbox/collect/sandbox-test
+        path: /run/runner-sandbox/staged/sandbox-test
+    - id: read-report
+      if: (success()) && steps.runner-sandbox-seal.outcome == 'success'
+      name: Read the staged report, as runner
+      run: |-
+        test "$(id -un)" = runner
+        f=/run/runner-sandbox/staged/report/report.txt
+        test "$(cat "$f")" = "report from runner-sandbox"
+        test "$(stat -c '%U:%G %a' "$f")" = "root:root 644"
+        echo "lines=$(wc -l <"$f")" >>"$GITHUB_OUTPUT"
+    - env:
+        LINES: ${{ steps.read-report.outputs.lines }}
+      if: (success()) && steps.runner-sandbox-seal.outcome == 'success'
+      name: The sandbox is sealed
+      run: |-
+        test "$LINES" = 1
+        for p in /var/lib/runner-sandbox/work/report.txt /home/runner-sandbox/private/notes; do
+          if cat "$p" 2>/dev/null; then echo "read $p after the seal"; exit 1; fi
+        done
+        for f in /dev/shm/sandbox-leftover /dev/shm/subuid-leftover; do
+          if test -e "$f"; then echo "the sandbox's $f survived the seal"; exit 1; fi
+        done
+        if pgrep -u runner-sandbox; then echo "a sandbox process survived the seal"; exit 1; fi
+        if /usr/local/bin/runner-sandbox-exec --stage late report.txt; then echo "staged after the seal"; exit 1; fi
+        if sudo -n true 2>/dev/null; then echo "runner has sudo in the publish phase"; exit 1; fi
+        # Same uid as Runner.Worker, but Yama keeps it from its memory.
+        worker=$(pgrep -f Runner.Worker | head -n1)
+        test -n "$worker"
+        if (exec 3<"/proc/$worker/mem") 2>/dev/null; then echo "opened Runner.Worker's memory"; exit 1; fi
+        echo "only staged outputs are left"
     timeout-minutes: 15
 name: Sandbox test
 on:

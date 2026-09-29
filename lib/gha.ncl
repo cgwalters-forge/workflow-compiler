@@ -1,13 +1,16 @@
-# A GitHub Actions workflow in which every job has two phases.
+# A GitHub Actions workflow in which every job has three phases
+# (docs/requirements.md has the whole picture).
 #
 # `runner_steps` run as the stock `runner` user, with its sudo, and set the
 # machine up: packages, checkout, network. The compiler then adds a step
 # that secures the host (runtime/secure-host.cjs) and one that enters the
-# sandbox (runtime/install.cjs). A `share` runner step publishes a file to
-# the sandbox read-only, under SHARE_DIR. Every step in `steps` runs
-# after that as the unprivileged sandbox user: `run:` steps get the sandbox
-# wrapper as their shell, and `uses:` steps are limited to the job's
-# `sandbox.allowed_actions`, pinned by commit.
+# sandbox (runtime/install.cjs), handing it the workspace. A `share` runner
+# step publishes a file to the sandbox read-only, under SHARE_DIR. Every
+# step in `steps` runs after that as the unprivileged sandbox user: `run:`
+# steps get the sandbox wrapper as their shell, and `stage` and `upload`
+# steps hand files out of it. A generated step then seals the sandbox, and
+# `publish_steps` run as runner, without sudo, with the job's tokens,
+# reading only what was staged.
 #
 # Fields otherwise map one to one onto the workflow syntax. The contracts
 # are closed records, so anything the compiler doesn't know how to keep
@@ -71,11 +74,11 @@ let OneOfRunUses = validator
   (fun step => "a step needs exactly one of `run` or `uses`")
 in
 
-let Allowed = fun allowed => validator
-  (fun step =>
-    !(std.record.has_field "uses" step)
-    || std.array.elem (std.array.first (std.string.split "@" step.uses)) allowed)
-  (fun step => "`%{step.uses}` is not in sandbox.allowed_actions; after the privileged phase an action runs as the runner user with the job's tokens")
+# Until the shim runs pure actions in the sandbox (#16), `steps` has no
+# actions at all: one there would run as runner, with the job's tokens.
+let NoActionInSandbox = validator
+  (fun step => !(std.record.has_field "uses" step))
+  (fun step => "`%{step.uses}` can't run in `steps` yet: credentialed actions go in `publish_steps`, which read staged outputs, and pure actions will run in the sandbox through a shim (#16)")
 in
 
 # checkout leaves the job's token in .git/config unless told not to, and
@@ -143,37 +146,48 @@ let ShareStep = {
   ],
 } in
 
-# An `upload` step in `steps` uploads a file or directory from the
-# sandbox's workspace as an artifact. Allowlisted actions run as runner
-# and follow symlinks, so upload-artifact pointed at the workspace would
-# upload whatever the sandbox links there (/proc/self/environ holds the
-# job's runtime token). The compiler emits instead a step that has the
-# wrapper's root side copy the path, refusing symlinks, to a root-owned
-# directory (runtime/run.cjs), then upload-artifact on that copy.
+# A `stage` step in `steps` hands a file or directory out of the sandbox's
+# workspace: the wrapper's root side copies it, refusing symlinks and
+# special files, to a root-owned directory, STAGED_DIR/<name>/, where
+# publish_steps read it (`gha.staged "<name>"`). Actions in publish_steps
+# run as runner and follow symlinks, so they must never read a path the
+# sandbox can write; after the seal they can't anyway.
+#
+# An `upload` step is a stage step plus an upload-artifact publish step
+# for it.
 let UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in # v7.0.1
-let COLLECT_DIR = "/run/runner-sandbox/collect" in
-let UploadStep = {
+let STAGED_DIR = "/run/runner-sandbox/staged" in
+# The id of the generated seal step, which publish steps check.
+let SEAL_ID = "runner-sandbox-seal" in
+let StageName = validator
+  (fun s => std.string.is_match "^[A-Za-z0-9_-]+$" s)
+  (fun s => "stage name `%{s}` must match [A-Za-z0-9_-]+")
+in
+let StagePath = validator
+  (fun s => std.string.is_match "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$" s && !(std.string.is_match "(^|/)\\.\\.?(/|$)" s))
+  (fun s => "stage path `%{s}` must be relative to the workspace, without `.` or `..`")
+in
+let StageFields = {
   name | String | optional,
-  # The collecting step's id (default `collect-<upload.name>`): its outcome
-  # says whether the path could be uploaded.
+  # The staging step's id (default `stage-<name>`): its outcome says
+  # whether the path could be staged.
   id | String | optional,
   "if" | String | optional,
   "continue-on-error" | Bool | optional,
+} in
+let StageStep = StageFields & { stage | { name | StageName, path | StagePath } } in
+let UploadStep = StageFields & {
   upload | {
-    name | validator
-      (fun s => std.string.is_match "^[A-Za-z0-9_-]+$" s)
-      (fun s => "upload name `%{s}` must match [A-Za-z0-9_-]+"),
+    name | StageName,
     # Relative to the sandbox's workspace.
-    path | validator
-      (fun s => std.string.is_match "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$" s && !(std.string.is_match "(^|/)\\.\\.?(/|$)" s))
-      (fun s => "upload path `%{s}` must be relative to the workspace, without `.` or `..`"),
+    path | StagePath,
     "retention-days" | Number | optional,
   },
 } in
 
 # No `shell` (the compiler sets it) and no `working-directory` (the wrapper
 # owns the working directory): both are errors here.
-let SandboxStep = fun allowed => std.contract.Sequence [
+let SandboxStep = std.contract.Sequence [
   {
     name | String | optional,
     id | String | optional,
@@ -186,7 +200,56 @@ let SandboxStep = fun allowed => std.contract.Sequence [
     "timeout-minutes" | Number | optional,
   },
   OneOfRunUses,
-  Allowed allowed,
+  NoActionInSandbox,
+] in
+
+# Expressions in a publish step's `run`, `with` and `env` may not use a
+# sandboxed step's outputs: they are strings the sandbox chose, and a
+# publish step runs as runner with the job's tokens, so they would be
+# script injection into it (#1). Only outputs of publish steps are
+# allowed, and whole-context spellings (`toJSON(steps)`, `steps['x']`) not
+# at all. A step's `outcome` and `conclusion` are set by the runner, and
+# `if:` is not checked. Like the secrets check, it looks at all of S after
+# each `${{`.
+let STEP_OUTPUTS_RE = "(?i)\\bsteps\\s*\\.\\s*([A-Za-z0-9_-]+)\\s*\\.\\s*outputs\\b" in
+let WHOLE_STEPS_RE = "(?i)\\bsteps\\b\\s*(\\[|[,)}]|$|\\.\\s*\\*|\\.\\s*[A-Za-z0-9_-]+\\s*(\\[|\\.\\s*\\*))" in
+let uses_sandbox_outputs = fun publish_ids s =>
+  std.is_string s
+  && std.array.any
+    (fun expr =>
+      std.string.is_match WHOLE_STEPS_RE expr
+      || std.array.any
+        (fun m => !(std.array.elem (std.string.lowercase (std.array.first m.groups)) publish_ids))
+        (std.string.find_all STEP_OUTPUTS_RE expr))
+    (std.array.drop_first (std.string.split "${{" s))
+in
+let step_strings = fun step =>
+  (if std.record.has_field "run" step then [step.run] else [])
+  @ (if std.record.has_field "working-directory" step then [step."working-directory"] else [])
+  @ (if std.record.has_field "with" step then std.record.values step.with else [])
+  @ (if std.record.has_field "env" step then std.record.values step.env else [])
+in
+let NoSandboxOutputs = fun publish_ids => validator
+  (fun step => !(std.array.any (uses_sandbox_outputs publish_ids) (step_strings step)))
+  (fun step => "a publish step can't use sandboxed steps' outputs in `run`, `working-directory`, `with` or `env`: they are strings the sandbox chose; stage a file instead, or test them in `if`")
+in
+
+let PublishStep = fun publish_ids => std.contract.Sequence [
+  {
+    name | String | optional,
+    id | String | optional,
+    "if" | String | optional,
+    run | String | optional,
+    shell | String | optional,
+    uses | Pinned | optional,
+    with | { _ : Dyn } | optional,
+    env | { _ : String } | optional,
+    "working-directory" | String | optional,
+    "continue-on-error" | Bool | optional,
+    "timeout-minutes" | Number | optional,
+  },
+  OneOfRunUses,
+  NoSandboxOutputs publish_ids,
 ] in
 
 let Sandbox = {
@@ -194,10 +257,6 @@ let Sandbox = {
   # Take root away from the runner user too, once the sandbox is entered;
   # its only sudo rule left is the wrapper.
   lock_runner_sudo | Bool | default = true,
-  # Actions (owner/repo[/path], without @ref) allowed in `steps`. They run as
-  # the runner user, not in the sandbox, so keep this short, and never point
-  # one at a path the sandbox can write: use an `upload` step for artifacts.
-  allowed_actions | Array String | default = [],
 } in
 
 # A relative path in the workspace, without `.` or `..` components.
@@ -231,8 +290,19 @@ let Job = {
   handoff | Handoff | default = {},
   # RunnerStep or ShareStep, checked in compile_job.
   runner_steps | Array Dyn | default = [],
+  # SandboxStep, StageStep or UploadStep.
   steps | Array Dyn,
+  # PublishStep: as runner, after the seal.
+  publish_steps | Array Dyn | default = [],
 } in
+
+# publish_steps run as runner after untrusted code; only with runner's
+# root taken away can they not undo the sandbox or read Runner.Worker's
+# memory (#32).
+let PublishNeedsLock = validator
+  (fun job => job.publish_steps == [] || job.sandbox.lock_runner_sudo)
+  (fun _job => "publish_steps need sandbox.lock_runner_sudo: they run as runner after the sandbox, which must not have root by then")
+in
 
 let Workflow = {
   name | String,
@@ -240,7 +310,7 @@ let Workflow = {
   on | Dyn,
   permissions | { _ : String } | optional,
   concurrency | Dyn | optional,
-  jobs | { _ : Job },
+  jobs | { _ : std.contract.Sequence [Job, PublishNeedsLock] },
 } in
 
 let install_step = fun sandbox job_handoff =>
@@ -308,50 +378,107 @@ let sandbox_step = fun step =>
     step
 in
 
-let upload_steps = fun step =>
-  let up = step.upload in
-  let id = if std.record.has_field "id" step then step.id else "collect-%{up.name}" in
-  let collect_step =
-    step
-    |> std.record.remove "upload"
-    |> std.record.filter (fun name _v => name != "id" && name != "name")
-    |> std.record.insert "id" id
-    |> std.record.insert "name" (if std.record.has_field "name" step then step.name else "Collect %{up.path} for upload (generated)")
-    |> std.record.insert "shell" "bash"
-    |> std.record.insert "run" "%{EXEC} --collect %{up.name} %{up.path}"
-  in
-  [
-    collect_step,
-    {
-      name = "Upload %{up.name} (generated)",
-      "if" = "!cancelled() && steps.%{id}.outcome == 'success'",
-      uses = UPLOAD_ARTIFACT,
-      with = { name = up.name, path = "%{COLLECT_DIR}/%{up.name}", if-no-files-found = "error" }
-        & (if std.record.has_field "retention-days" up then { retention-days = up."retention-days" } else {}),
-    },
-  ]
+# The sandboxed step that stages STEP's `stage` or `upload` record (FIELD).
+let stage_step = fun field step =>
+  let st = step."%{field}" in
+  let id = if std.record.has_field "id" step then step.id else "stage-%{st.name}" in
+  step
+  |> std.record.remove field
+  |> std.record.filter (fun name _v => name != "id" && name != "name")
+  |> std.record.insert "id" id
+  |> std.record.insert "name" (if std.record.has_field "name" step then step.name else "Stage %{st.path} as %{st.name} (generated)")
+  |> std.record.insert "shell" "bash"
+  |> std.record.insert "run" "%{EXEC} --stage %{st.name} %{st.path}"
 in
 
-let COMPILER_FIELDS = ["sandbox", "handoff", "runner_steps", "steps"] in
+# The publish step uploading what an `upload` step staged.
+let upload_publish_step = fun step =>
+  let up = step.upload in
+  let id = if std.record.has_field "id" step then step.id else "stage-%{up.name}" in
+  {
+    name = "Upload %{up.name} (generated)",
+    "if" = "!cancelled() && steps.%{id}.outcome == 'success' && steps.%{SEAL_ID}.outcome == 'success'",
+    uses = UPLOAD_ARTIFACT,
+    with = { name = up.name, path = "%{STAGED_DIR}/%{up.name}", if-no-files-found = "error" }
+      & (if std.record.has_field "retention-days" up then { retention-days = up."retention-days" } else {}),
+  }
+in
+
+# Runs as runner once the sandboxed steps are done, whether they
+# succeeded or not: the wrapper's root side stops the sandbox's processes
+# and makes its files unreadable to runner, so publish_steps (and the
+# post-steps of runner_steps actions) can only read what was staged.
+let seal_step = {
+  name = "Seal the sandbox (generated)",
+  id = SEAL_ID,
+  "if" = "always()",
+  shell = "bash",
+  run = "%{EXEC} --seal",
+} in
+
+let COMPILER_FIELDS = ["sandbox", "handoff", "runner_steps", "steps", "publish_steps"] in
 
 let compile_job = fun job =>
   let sandbox = job.sandbox in
   let steps =
-    std.array.flat_map
+    std.array.map
       (fun s =>
-        if std.record.has_field "upload" s then
-          upload_steps (s | UploadStep)
+        if std.record.has_field "stage" s then
+          stage_step "stage" (s | StageStep)
+        else if std.record.has_field "upload" s then
+          stage_step "upload" (s | UploadStep)
         else
-          [sandbox_step (s | SandboxStep sandbox.allowed_actions)])
+          sandbox_step (s | SandboxStep))
       job.steps
   in
+  let uploads = std.array.map upload_publish_step (std.array.filter (fun s => std.record.has_field "upload" s) job.steps) in
+  let publish_ids =
+    std.array.map (fun s => std.string.lowercase s.id) (std.array.filter (fun s => std.is_record s && std.record.has_field "id" s) job.publish_steps)
+  in
+  # Fail closed: a publish step runs only after a successful seal, on top
+  # of its own condition (with the implicit success() if it has none).
+  let after_seal = fun s =>
+    let raw = if std.record.has_field "if" s then std.string.trim s."if" else "success()" in
+    let cond =
+      if std.string.is_match "^\\$\\{\\{.*\\}\\}$" raw then
+        std.string.substring 3 (std.string.length raw - 2) raw
+      else
+        raw
+    in
+    # The condition is wrapped in parentheses, so they must balance in it
+    # (outside string literals), or `always()) || (true` would escape; and
+    # it must be one expression, not a template like `${{ 'a' }} ${{ 'b' }}`,
+    # which is a string, and true.
+    let depths =
+      std.array.fold_left
+        (fun acc c => if c == "(" then acc @ [std.array.last acc + 1] else if c == ")" then acc @ [std.array.last acc - 1] else acc)
+        [0]
+        (std.string.characters (std.string.replace_regex "'([^']|'')*'" "''" cond))
+    in
+    if std.array.any (fun d => d < 0) depths || std.array.last depths != 0
+      || std.string.contains "${{" cond || std.string.contains "}}" cond then
+      std.fail_with "a publish step's `if` must be one expression with balanced parentheses: %{cond}"
+    else
+      std.record.filter (fun n _v => n != "if") s
+      |> std.record.insert "if" "(%{std.string.trim cond}) && steps.%{SEAL_ID}.outcome == 'success'"
+  in
+  let publish = std.array.map (fun s => after_seal (s | PublishStep publish_ids)) job.publish_steps in
   job
   |> std.record.filter (fun name _v => !(std.array.elem name COMPILER_FIELDS))
-  |> std.record.insert "steps" (std.array.map runner_step job.runner_steps @ [secure_host_step, install_step sandbox job.handoff] @ steps)
+  |> std.record.insert "steps" (
+    std.array.map runner_step job.runner_steps
+    @ [secure_host_step, install_step sandbox job.handoff]
+    @ steps
+    @ [seal_step]
+    @ uploads
+    @ publish
+  )
 in
 
 {
   share_dir = SHARE_DIR,
+  # Where publish_steps find what a `stage` step named NAME staged.
+  staged = fun name => "%{STAGED_DIR}/%{name}",
   compile = fun source =>
     let wf = source | Workflow in
     wf
