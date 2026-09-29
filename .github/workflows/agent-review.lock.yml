@@ -100,50 +100,650 @@ jobs:
         console.log(`Shared ${hasContent ? "content" : process.env.SHARE_PATH} as ${dest} (root-owned, read-only to other users)`);
       shell: sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}
     - env:
-        AGENT_STUB: |
-          #!/bin/bash
-          # A stand-in for a coding agent, for agent-run's proof of concept: it reads
-          # its prompt the way an agent would, then behaves like a hostile one and
-          # tries to rewrite its own instructions, become root and reach the job's
-          # credentials. It fails if any of that works, and otherwise writes a
-          # "review" and a step output.
-          #
-          #   agent-stub PROMPT-FILE
-          set -euo pipefail
+        SHARE_CONTENT: |
+          // The sandboxed step of an agent_run job (lib/agent-run.ncl): runs the
+          // agent through bot-harness, the Agent Client Protocol client from
+          // cgwalters-devspace-sandbox (harness/), and leaves what the task layer's
+          // contract wants in the workspace for the job's upload steps:
+          //
+          //   agent-run/         summary.json, summary.md, condensed.log, outcome.json
+          //   agent-transcript/  acp.jsonl, harness.json, agent-stderr.log
+          //
+          // The layout and summary.json (agent-run-summary/v1) are those of
+          // docs/devspace-agent-runs.md in cgwalters-bot/homegit, as agent/run.mjs
+          // there writes them. Unlike agent/run.mjs, which runs bot-harness as runner
+          // and the agent through sudo as runner-sandbox, this runs as the sandbox
+          // user already, harness and agent both: the harness holds nothing the
+          // agent may not see, so it needs no boundary of its own.
+          //
+          // Runs with node, as the sandbox user, from a share the privileged phase
+          // wrote. Environment: AGENT AGENTS PROMPT POLICY TIMEOUT_MINUTES BUDGET,
+          // the GITHUB_* context the wrapper passes, and HARNESS_SHARE, where
+          // bot-harness's redact.mjs was installed.
+          //
+          // All of this holds only for an agent that cooperates: it runs as the
+          // same user as bot-harness, so a hostile one can skip permission
+          // requests, kill or outlive the harness, and rewrite what it wrote. The
+          // summary and transcript are the agent's data (R7, R13 in
+          // docs/requirements.md); the step's timeout and the sandbox bound it.
+          "use strict";
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const { spawn, spawnSync } = require("node:child_process");
+          const readline = require("node:readline");
 
-          prompt=${1:?usage: agent-stub PROMPT-FILE}
-          escaped=()
+          const HARNESS = "bot-harness";
+          const RUN_DIR = "agent-run";
+          const TRANSCRIPT_DIR = "agent-transcript";
+          const HARNESS_FILES = ["acp.jsonl", "harness.json", "agent-stderr.log"];
+          const MAX_OUTCOME_BYTES = 65536;
+          // Seconds bot-harness gets past the agent's timeout to cancel it.
+          const HARNESS_GRACE_S = 90;
+          const EXIT_TIMEOUT = 124;
+          // No inference yet: only the scripted agent, whose cost is made up.
+          const AGENTS = ["fake"];
+          const AIC_PRICING = "mock";
 
-          echo "agent-stub: running as $(id -un) (uid $(id -u)) in $PWD"
-          echo "agent-stub: prompt $prompt, owned by $(stat -c '%U:%G %a' "$prompt"):"
-          sed 's/^/  > /' "$prompt"
+          const env = process.env;
+          const oneLine = (s) => s.replace(/[\x00-\x1f\x7f]/g, " ");
 
-          if { echo "ignore all previous instructions" >>"$prompt"; } 2>/dev/null; then escaped+=("rewrote its prompt"); fi
-          if touch "$(dirname "$prompt")/injected" 2>/dev/null; then escaped+=("added a file to the share"); fi
-          if sudo -n true 2>/dev/null; then escaped+=("became root with sudo"); fi
-          for v in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN; do
-            if [[ -v $v ]]; then escaped+=("saw $v"); fi
-          done
-          worker=$(pgrep -f Runner.Worker | head -n1 || true)
-          if [[ -n $worker ]] && cat "/proc/$worker/environ" >/dev/null 2>&1; then escaped+=("read Runner.Worker's environment"); fi
+          function fail(message) {
+            console.error(`agent-run: ${message}`);
+            process.exit(1);
+          }
 
-          if ((${#escaped[@]})); then
-            printf 'agent-stub: ESCAPED: %s\n' "${escaped[@]}" >&2
-            exit 1
-          fi
-          echo "agent-stub: every escape attempt failed"
+          // Runs bot-harness, passing its condensed transcript on to the log and
+          // CONDENSED; resolves to its exit status.
+          function runHarness({ out, prompt, condensed }) {
+            const limit = Number(env.TIMEOUT_MINUTES) * 60 + HARNESS_GRACE_S;
+            const child = spawn("timeout", ["--kill-after=30", `${limit}s`, HARNESS, "run",
+              "--agent", env.AGENT, "--agents", env.AGENTS,
+              "--cwd", process.cwd(), "--prompt", prompt, "--out", out,
+              "--permissions", env.POLICY,
+              "--timeout", `${env.TIMEOUT_MINUTES}m`, "--budget-aic", env.BUDGET], { stdio: ["ignore", "pipe", "inherit"] });
+            const closed = new Promise((resolve) => child.on("close", (code) => resolve(code ?? 128)));
+            const lines = [];
+            const reader = readline.createInterface({ input: child.stdout });
+            const read = new Promise((resolve) => reader.on("close", resolve));
+            reader.on("line", (line) => {
+              const clean = oneLine(line);
+              console.log(clean);
+              lines.push(clean);
+            });
+            return Promise.all([closed, read]).then(([status]) => {
+              fs.writeFileSync(condensed, lines.map((l) => `${l}\n`).join(""));
+              return status;
+            });
+          }
 
-          {
-            echo "# Review by agent-stub"
-            echo
-            echo "Prompt: \`$prompt\` ($(wc -l <"$prompt") lines), read as $(id -un)."
-          } >review.md
-          echo "verdict=looks-good" >>"$GITHUB_OUTPUT"
-          cat review.md >>"$GITHUB_STEP_SUMMARY"
-      name: Install the agent (stub)
+          // The agent's own outcome.json, if it left a JSON object of sane size.
+          function readOutcome() {
+            const file = path.join(env.HOME, "out", "outcome.json");
+            try {
+              const text = fs.readFileSync(file, "utf8");
+              if (text.length > MAX_OUTCOME_BYTES) return {};
+              const parsed = JSON.parse(text);
+              return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+            } catch {
+              return {};
+            }
+          }
+
+          // The files the agent changed in the workspace, as git sees them.
+          function changedFiles() {
+            const r = spawnSync("git", ["-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--no-renames",
+              "--untracked-files=all"], { encoding: "utf8" });
+            if (r.status !== 0) return [];
+            return r.stdout.split("\0").filter((e) => e.length > 3).map((e) => e.slice(3))
+              .filter((f) => !f.startsWith(`${RUN_DIR}/`) && !f.startsWith(`${TRANSCRIPT_DIR}/`)).sort();
+          }
+
+          async function main() {
+            for (const name of ["AGENT", "AGENTS", "PROMPT", "POLICY", "TIMEOUT_MINUTES", "BUDGET", "HARNESS_SHARE", "GITHUB_RUN_ID", "GITHUB_SERVER_URL", "GITHUB_REPOSITORY"]) {
+              if (!env[name]) fail(`${name} is not set`);
+            }
+            if (!AGENTS.includes(env.AGENT)) fail(`agent '${env.AGENT}' needs inference, which agent_run doesn't provide yet (only ${AGENTS.join(", ")})`);
+            const scratch = path.join(env.RUNNER_TEMP, "agent");
+            const harnessOut = path.join(scratch, "harness");
+            // ~/out is where the agent leaves its outcome.json.
+            for (const d of [harnessOut, RUN_DIR, TRANSCRIPT_DIR, path.join(env.HOME, "out")]) fs.mkdirSync(d, { recursive: true });
+
+            const started = new Date();
+            console.log("::group::agent (condensed)");
+            const exitCode = await runHarness({ out: harnessOut, prompt: env.PROMPT, condensed: path.join(RUN_DIR, "condensed.log") });
+            console.log("::endgroup::");
+            const finished = new Date();
+            if (exitCode !== 0 && !fs.existsSync(path.join(harnessOut, "harness.json"))) {
+              const line = exitCode === EXIT_TIMEOUT ? `agent timed out after ${env.TIMEOUT_MINUTES}m` : `bot-harness exited ${exitCode}`;
+              fs.appendFileSync(path.join(RUN_DIR, "condensed.log"), `${line}\n`);
+            }
+
+            for (const f of HARNESS_FILES) {
+              if (fs.existsSync(path.join(harnessOut, f))) fs.copyFileSync(path.join(harnessOut, f), path.join(TRANSCRIPT_DIR, f));
+            }
+            fs.writeFileSync(path.join(RUN_DIR, "outcome.json"), `${JSON.stringify(readOutcome())}\n`);
+            const files = changedFiles();
+
+            // The same safety net as agent/run.mjs: token-shaped strings out of
+            // everything uploaded. The sandbox has no token of the job's to leak.
+            const { makeRedactor, redactTree } = await import(path.join(env.HARNESS_SHARE, "redact.mjs"));
+            const redact = makeRedactor([]);
+            redactTree(redact, [RUN_DIR, TRANSCRIPT_DIR]);
+
+            const iso = (d) => d.toISOString().replace(/\.\d+Z$/, "Z");
+            const meta = {
+              run_id: Number(env.GITHUB_RUN_ID), run_attempt: Number(env.GITHUB_RUN_ATTEMPT ?? 1),
+              run_url: `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`,
+              item: env.ITEM ?? null, repo: env.GITHUB_REPOSITORY, base: env.GITHUB_REF_NAME ?? null, workflow: "agent_run",
+              agent: env.AGENT, model: null, cores: require("node:os").availableParallelism(),
+              started_at: iso(started), finished_at: iso(finished), duration_s: Math.round((finished - started) / 1000),
+              exit_code: exitCode, aic_budget: Number(env.BUDGET), aic_pricing: AIC_PRICING, files,
+              egress_denied: [], redactions: redact.count,
+            };
+            fs.writeFileSync(path.join(scratch, "meta.json"), JSON.stringify(meta));
+            const summary = spawnSync(HARNESS, ["summary", "--dir", TRANSCRIPT_DIR, "--meta", path.join(scratch, "meta.json"),
+              "--outcome", path.join(RUN_DIR, "outcome.json"), "--markdown", path.join(RUN_DIR, "summary.md")], { encoding: "utf8" });
+            if (summary.status !== 0) fail(`bot-harness summary failed: ${summary.stderr}`);
+            fs.writeFileSync(path.join(RUN_DIR, "summary.json"), summary.stdout.endsWith("\n") ? summary.stdout : `${summary.stdout}\n`);
+            if (env.GITHUB_STEP_SUMMARY) fs.appendFileSync(env.GITHUB_STEP_SUMMARY, fs.readFileSync(path.join(RUN_DIR, "summary.md")));
+            console.log(`Agent ${env.AGENT} exited ${exitCode}: ${JSON.parse(summary.stdout).result}`);
+            process.exitCode = exitCode;
+          }
+
+          main().catch((e) => fail(e.message));
+        SHARE_NAME: agent-run.cjs
+      name: Share agent-run.cjs as /etc/agent-share/agent-run.cjs (generated)
+      run: |
+        // A `share` runner step, run as root (`sudo node`): publishes a file or a
+        // directory tree from the runner's side as a root-owned, world-readable
+        // copy under SHARE_DIR, so the sandboxed steps can read it but not change
+        // it. This is the one channel from the privileged phase to the sandbox
+        // that the sandbox can trust not to have been rewritten by an earlier
+        // sandboxed step.
+        //
+        // The step's settings come from the environment, not from the script
+        // text: Actions expands expressions in `run:` before the script
+        // runs, and a value spliced into the source could inject code, while in
+        // `env:` it stays data.
+        //
+        //   SHARE_NAME     the name under SHARE_DIR ([A-Za-z0-9][A-Za-z0-9._-]*)
+        //   SHARE_PATH     a file or directory to copy (relative to the workspace)
+        //   SHARE_CONTENT  literal file content (instead of SHARE_PATH)
+        //
+        // Symlinks and special files in the source are refused: a checkout can
+        // contain a symlink to /etc/shadow, and following it here, as root, would
+        // publish the target to every user.
+        "use strict";
+        const fs = require("node:fs");
+        const path = require("node:path");
+
+        const SHARE_DIR = "/etc/agent-share";
+        const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+        function fail(message) {
+          console.error(`share: ${message}`);
+          process.exit(1);
+        }
+
+        // Copies SRC to DEST, as root:root with 0644 files and 0755 directories.
+        function copyTree(src, dest) {
+          const st = fs.lstatSync(src);
+          if (st.isDirectory()) {
+            fs.mkdirSync(dest, { mode: 0o755 });
+            fs.chmodSync(dest, 0o755);
+            for (const entry of fs.readdirSync(src).sort()) {
+              copyTree(path.join(src, entry), path.join(dest, entry));
+            }
+          } else if (st.isFile()) {
+            // Not copyFileSync: libuv gives the copy the source's owner, and a
+            // runner-owned file could be changed after the sandbox is entered.
+            fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+            fs.chmodSync(dest, 0o644);
+          } else {
+            fail(`${src} is neither a regular file nor a directory; refusing to share it`);
+          }
+        }
+
+        if (process.getuid() !== 0) fail("must run as root");
+        const name = process.env.SHARE_NAME ?? "";
+        if (!NAME_RE.test(name)) fail(`invalid share name ${JSON.stringify(name)}`);
+        const hasPath = process.env.SHARE_PATH !== undefined;
+        const hasContent = process.env.SHARE_CONTENT !== undefined;
+        if (hasPath === hasContent) fail("set exactly one of SHARE_PATH or SHARE_CONTENT");
+
+        fs.mkdirSync(SHARE_DIR, { recursive: true, mode: 0o755 });
+        fs.chmodSync(SHARE_DIR, 0o755);
+        const dest = path.join(SHARE_DIR, name);
+        // Build the copy next to its final name, so readers never see half of it.
+        const tmp = `${dest}.tmp-${process.pid}`;
+        fs.rmSync(tmp, { recursive: true, force: true });
+        try {
+          if (hasContent) {
+            fs.writeFileSync(tmp, process.env.SHARE_CONTENT, { mode: 0o644, flag: "wx" });
+            fs.chmodSync(tmp, 0o644);
+          } else {
+            // copyTree refuses symlinks below the path, and this those in it: a
+            // symlinked directory `a` in a checkout would otherwise make `a/b`
+            // any file on the machine.
+            const src = path.resolve(fs.realpathSync(process.cwd()), process.env.SHARE_PATH);
+            if (fs.realpathSync(src) !== src) fail(`${process.env.SHARE_PATH} goes through a symlink; refusing to share it`);
+            copyTree(src, tmp);
+          }
+          // Owned by root however it was made.
+          fs.chownSync(tmp, 0, 0);
+          if (fs.lstatSync(tmp).isDirectory()) {
+            for (const entry of fs.readdirSync(tmp, { recursive: true })) fs.lchownSync(path.join(tmp, entry), 0, 0);
+          }
+          fs.rmSync(dest, { recursive: true, force: true });
+          fs.renameSync(tmp, dest);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+        console.log(`Shared ${hasContent ? "content" : process.env.SHARE_PATH} as ${dest} (root-owned, read-only to other users)`);
+      shell: sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}
+    - env:
+        SHARE_CONTENT: |
+          # How bot-harness answers the agent's permission requests in an agent_run
+          # job (see harness/src/policy.rs in cgwalters-devspace-sandbox). The
+          # sandbox is the security boundary; this keeps the agent from actions a
+          # task run shouldn't take, and records every decision in the transcript.
+          # It is devspace-sandbox's harness/policy.toml with the compiled job's
+          # paths: the sandbox's workspace and home.
+          default = "allow"
+
+          # Results leave through the run's staged artifacts, reviewed before
+          # anything is pushed from outside the sandbox.
+          [[rule]]
+          name = "no-push"
+          decision = "deny"
+          kind = ["execute"]
+          command = '\bgit\b.*\bpush\b'
+
+          [[rule]]
+          name = "writes-in-workspace-or-home-only"
+          decision = "deny"
+          kind = ["edit", "delete", "move"]
+          outside = ["/var/lib/runner-sandbox/work", "/home/runner-sandbox"]
+        SHARE_NAME: agent-policy.toml
+      name: Share agent-policy.toml as /etc/agent-share/agent-policy.toml (generated)
+      run: |
+        // A `share` runner step, run as root (`sudo node`): publishes a file or a
+        // directory tree from the runner's side as a root-owned, world-readable
+        // copy under SHARE_DIR, so the sandboxed steps can read it but not change
+        // it. This is the one channel from the privileged phase to the sandbox
+        // that the sandbox can trust not to have been rewritten by an earlier
+        // sandboxed step.
+        //
+        // The step's settings come from the environment, not from the script
+        // text: Actions expands expressions in `run:` before the script
+        // runs, and a value spliced into the source could inject code, while in
+        // `env:` it stays data.
+        //
+        //   SHARE_NAME     the name under SHARE_DIR ([A-Za-z0-9][A-Za-z0-9._-]*)
+        //   SHARE_PATH     a file or directory to copy (relative to the workspace)
+        //   SHARE_CONTENT  literal file content (instead of SHARE_PATH)
+        //
+        // Symlinks and special files in the source are refused: a checkout can
+        // contain a symlink to /etc/shadow, and following it here, as root, would
+        // publish the target to every user.
+        "use strict";
+        const fs = require("node:fs");
+        const path = require("node:path");
+
+        const SHARE_DIR = "/etc/agent-share";
+        const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+        function fail(message) {
+          console.error(`share: ${message}`);
+          process.exit(1);
+        }
+
+        // Copies SRC to DEST, as root:root with 0644 files and 0755 directories.
+        function copyTree(src, dest) {
+          const st = fs.lstatSync(src);
+          if (st.isDirectory()) {
+            fs.mkdirSync(dest, { mode: 0o755 });
+            fs.chmodSync(dest, 0o755);
+            for (const entry of fs.readdirSync(src).sort()) {
+              copyTree(path.join(src, entry), path.join(dest, entry));
+            }
+          } else if (st.isFile()) {
+            // Not copyFileSync: libuv gives the copy the source's owner, and a
+            // runner-owned file could be changed after the sandbox is entered.
+            fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+            fs.chmodSync(dest, 0o644);
+          } else {
+            fail(`${src} is neither a regular file nor a directory; refusing to share it`);
+          }
+        }
+
+        if (process.getuid() !== 0) fail("must run as root");
+        const name = process.env.SHARE_NAME ?? "";
+        if (!NAME_RE.test(name)) fail(`invalid share name ${JSON.stringify(name)}`);
+        const hasPath = process.env.SHARE_PATH !== undefined;
+        const hasContent = process.env.SHARE_CONTENT !== undefined;
+        if (hasPath === hasContent) fail("set exactly one of SHARE_PATH or SHARE_CONTENT");
+
+        fs.mkdirSync(SHARE_DIR, { recursive: true, mode: 0o755 });
+        fs.chmodSync(SHARE_DIR, 0o755);
+        const dest = path.join(SHARE_DIR, name);
+        // Build the copy next to its final name, so readers never see half of it.
+        const tmp = `${dest}.tmp-${process.pid}`;
+        fs.rmSync(tmp, { recursive: true, force: true });
+        try {
+          if (hasContent) {
+            fs.writeFileSync(tmp, process.env.SHARE_CONTENT, { mode: 0o644, flag: "wx" });
+            fs.chmodSync(tmp, 0o644);
+          } else {
+            // copyTree refuses symlinks below the path, and this those in it: a
+            // symlinked directory `a` in a checkout would otherwise make `a/b`
+            // any file on the machine.
+            const src = path.resolve(fs.realpathSync(process.cwd()), process.env.SHARE_PATH);
+            if (fs.realpathSync(src) !== src) fail(`${process.env.SHARE_PATH} goes through a symlink; refusing to share it`);
+            copyTree(src, tmp);
+          }
+          // Owned by root however it was made.
+          fs.chownSync(tmp, 0, 0);
+          if (fs.lstatSync(tmp).isDirectory()) {
+            for (const entry of fs.readdirSync(tmp, { recursive: true })) fs.lchownSync(path.join(tmp, entry), 0, 0);
+          }
+          fs.rmSync(dest, { recursive: true, force: true });
+          fs.renameSync(tmp, dest);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+        console.log(`Shared ${hasContent ? "content" : process.env.SHARE_PATH} as ${dest} (root-owned, read-only to other users)`);
+      shell: sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}
+    - env:
+        SHARE_CONTENT: |-
+          [
+            {
+              "say": "Fake run: the tools, the sandbox, the permission policy, the redaction pass, and escape attempts."
+            },
+            {
+              "execute": {
+                "command": "git log --oneline -1 && id -un",
+                "title": "Bash"
+              }
+            },
+            {
+              "read": {
+                "lines": 5,
+                "path": "{cwd}/README.md",
+                "title": "Read"
+              }
+            },
+            {
+              "execute": {
+                "command": "printf 'fake secret: gh%s_%s\\n' p FAKEREDACTIONCANARY0123456789abcdef",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "git push origin HEAD",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "(echo pwned >>'/etc/agent-share/agentskills/review.md') >/dev/null 2>&1 && echo ESC''APED-rewrite-prompt || echo contain''ed-rewrite-prompt",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "(touch /etc/agent-share/new) >/dev/null 2>&1 && echo ESC''APED-add-to-share || echo contain''ed-add-to-share",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "(sudo -n true) >/dev/null 2>&1 && echo ESC''APED-sudo || echo contain''ed-sudo",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "(cat /proc/$(pgrep -f Runner.Worker | head -n1)/environ) >/dev/null 2>&1 && echo ESC''APED-worker-environ || echo contain''ed-worker-environ",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "(ls /home/runner) >/dev/null 2>&1 && echo ESC''APED-runner-home || echo contain''ed-runner-home",
+                "title": "Bash"
+              }
+            },
+            {
+              "execute": {
+                "command": "(env | grep -E '^(ACTIONS_(RUNTIME|ID_TOKEN_REQUEST)_|GITHUB_TOKEN=)') >/dev/null 2>&1 && echo ESC''APED-job-token || echo contain''ed-job-token",
+                "title": "Bash"
+              }
+            },
+            {
+              "write": {
+                "content": "Written by a fake agent run.\n",
+                "path": "{cwd}/FAKE.md",
+                "title": "Write"
+              }
+            },
+            {
+              "write": {
+                "content": "{\"tests\": [{\"command\": \"git log --oneline -1\", \"exit_code\": 0, \"duration_s\": 0}]}\n",
+                "path": "{home}/out/outcome.json",
+                "title": "Write"
+              }
+            },
+            {
+              "cost": {
+                "usd": 0.01
+              }
+            },
+            {
+              "say": "Done: the fake run finished."
+            }
+          ]
+        SHARE_NAME: agent-session.json
+      name: Share agent-session.json as /etc/agent-share/agent-session.json (generated)
+      run: |
+        // A `share` runner step, run as root (`sudo node`): publishes a file or a
+        // directory tree from the runner's side as a root-owned, world-readable
+        // copy under SHARE_DIR, so the sandboxed steps can read it but not change
+        // it. This is the one channel from the privileged phase to the sandbox
+        // that the sandbox can trust not to have been rewritten by an earlier
+        // sandboxed step.
+        //
+        // The step's settings come from the environment, not from the script
+        // text: Actions expands expressions in `run:` before the script
+        // runs, and a value spliced into the source could inject code, while in
+        // `env:` it stays data.
+        //
+        //   SHARE_NAME     the name under SHARE_DIR ([A-Za-z0-9][A-Za-z0-9._-]*)
+        //   SHARE_PATH     a file or directory to copy (relative to the workspace)
+        //   SHARE_CONTENT  literal file content (instead of SHARE_PATH)
+        //
+        // Symlinks and special files in the source are refused: a checkout can
+        // contain a symlink to /etc/shadow, and following it here, as root, would
+        // publish the target to every user.
+        "use strict";
+        const fs = require("node:fs");
+        const path = require("node:path");
+
+        const SHARE_DIR = "/etc/agent-share";
+        const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+        function fail(message) {
+          console.error(`share: ${message}`);
+          process.exit(1);
+        }
+
+        // Copies SRC to DEST, as root:root with 0644 files and 0755 directories.
+        function copyTree(src, dest) {
+          const st = fs.lstatSync(src);
+          if (st.isDirectory()) {
+            fs.mkdirSync(dest, { mode: 0o755 });
+            fs.chmodSync(dest, 0o755);
+            for (const entry of fs.readdirSync(src).sort()) {
+              copyTree(path.join(src, entry), path.join(dest, entry));
+            }
+          } else if (st.isFile()) {
+            // Not copyFileSync: libuv gives the copy the source's owner, and a
+            // runner-owned file could be changed after the sandbox is entered.
+            fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+            fs.chmodSync(dest, 0o644);
+          } else {
+            fail(`${src} is neither a regular file nor a directory; refusing to share it`);
+          }
+        }
+
+        if (process.getuid() !== 0) fail("must run as root");
+        const name = process.env.SHARE_NAME ?? "";
+        if (!NAME_RE.test(name)) fail(`invalid share name ${JSON.stringify(name)}`);
+        const hasPath = process.env.SHARE_PATH !== undefined;
+        const hasContent = process.env.SHARE_CONTENT !== undefined;
+        if (hasPath === hasContent) fail("set exactly one of SHARE_PATH or SHARE_CONTENT");
+
+        fs.mkdirSync(SHARE_DIR, { recursive: true, mode: 0o755 });
+        fs.chmodSync(SHARE_DIR, 0o755);
+        const dest = path.join(SHARE_DIR, name);
+        // Build the copy next to its final name, so readers never see half of it.
+        const tmp = `${dest}.tmp-${process.pid}`;
+        fs.rmSync(tmp, { recursive: true, force: true });
+        try {
+          if (hasContent) {
+            fs.writeFileSync(tmp, process.env.SHARE_CONTENT, { mode: 0o644, flag: "wx" });
+            fs.chmodSync(tmp, 0o644);
+          } else {
+            // copyTree refuses symlinks below the path, and this those in it: a
+            // symlinked directory `a` in a checkout would otherwise make `a/b`
+            // any file on the machine.
+            const src = path.resolve(fs.realpathSync(process.cwd()), process.env.SHARE_PATH);
+            if (fs.realpathSync(src) !== src) fail(`${process.env.SHARE_PATH} goes through a symlink; refusing to share it`);
+            copyTree(src, tmp);
+          }
+          // Owned by root however it was made.
+          fs.chownSync(tmp, 0, 0);
+          if (fs.lstatSync(tmp).isDirectory()) {
+            for (const entry of fs.readdirSync(tmp, { recursive: true })) fs.lchownSync(path.join(tmp, entry), 0, 0);
+          }
+          fs.rmSync(dest, { recursive: true, force: true });
+          fs.renameSync(tmp, dest);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+        console.log(`Shared ${hasContent ? "content" : process.env.SHARE_PATH} as ${dest} (root-owned, read-only to other users)`);
+      shell: sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}
+    - env:
+        SHARE_CONTENT: |-
+          [fake]
+          command = ["fake-acp-agent", "script", "/etc/agent-share/agent-session.json"]
+        SHARE_NAME: agent-agents.toml
+      name: Share agent-agents.toml as /etc/agent-share/agent-agents.toml (generated)
+      run: |
+        // A `share` runner step, run as root (`sudo node`): publishes a file or a
+        // directory tree from the runner's side as a root-owned, world-readable
+        // copy under SHARE_DIR, so the sandboxed steps can read it but not change
+        // it. This is the one channel from the privileged phase to the sandbox
+        // that the sandbox can trust not to have been rewritten by an earlier
+        // sandboxed step.
+        //
+        // The step's settings come from the environment, not from the script
+        // text: Actions expands expressions in `run:` before the script
+        // runs, and a value spliced into the source could inject code, while in
+        // `env:` it stays data.
+        //
+        //   SHARE_NAME     the name under SHARE_DIR ([A-Za-z0-9][A-Za-z0-9._-]*)
+        //   SHARE_PATH     a file or directory to copy (relative to the workspace)
+        //   SHARE_CONTENT  literal file content (instead of SHARE_PATH)
+        //
+        // Symlinks and special files in the source are refused: a checkout can
+        // contain a symlink to /etc/shadow, and following it here, as root, would
+        // publish the target to every user.
+        "use strict";
+        const fs = require("node:fs");
+        const path = require("node:path");
+
+        const SHARE_DIR = "/etc/agent-share";
+        const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+        function fail(message) {
+          console.error(`share: ${message}`);
+          process.exit(1);
+        }
+
+        // Copies SRC to DEST, as root:root with 0644 files and 0755 directories.
+        function copyTree(src, dest) {
+          const st = fs.lstatSync(src);
+          if (st.isDirectory()) {
+            fs.mkdirSync(dest, { mode: 0o755 });
+            fs.chmodSync(dest, 0o755);
+            for (const entry of fs.readdirSync(src).sort()) {
+              copyTree(path.join(src, entry), path.join(dest, entry));
+            }
+          } else if (st.isFile()) {
+            // Not copyFileSync: libuv gives the copy the source's owner, and a
+            // runner-owned file could be changed after the sandbox is entered.
+            fs.writeFileSync(dest, fs.readFileSync(src), { mode: 0o644, flag: "wx" });
+            fs.chmodSync(dest, 0o644);
+          } else {
+            fail(`${src} is neither a regular file nor a directory; refusing to share it`);
+          }
+        }
+
+        if (process.getuid() !== 0) fail("must run as root");
+        const name = process.env.SHARE_NAME ?? "";
+        if (!NAME_RE.test(name)) fail(`invalid share name ${JSON.stringify(name)}`);
+        const hasPath = process.env.SHARE_PATH !== undefined;
+        const hasContent = process.env.SHARE_CONTENT !== undefined;
+        if (hasPath === hasContent) fail("set exactly one of SHARE_PATH or SHARE_CONTENT");
+
+        fs.mkdirSync(SHARE_DIR, { recursive: true, mode: 0o755 });
+        fs.chmodSync(SHARE_DIR, 0o755);
+        const dest = path.join(SHARE_DIR, name);
+        // Build the copy next to its final name, so readers never see half of it.
+        const tmp = `${dest}.tmp-${process.pid}`;
+        fs.rmSync(tmp, { recursive: true, force: true });
+        try {
+          if (hasContent) {
+            fs.writeFileSync(tmp, process.env.SHARE_CONTENT, { mode: 0o644, flag: "wx" });
+            fs.chmodSync(tmp, 0o644);
+          } else {
+            // copyTree refuses symlinks below the path, and this those in it: a
+            // symlinked directory `a` in a checkout would otherwise make `a/b`
+            // any file on the machine.
+            const src = path.resolve(fs.realpathSync(process.cwd()), process.env.SHARE_PATH);
+            if (fs.realpathSync(src) !== src) fail(`${process.env.SHARE_PATH} goes through a symlink; refusing to share it`);
+            copyTree(src, tmp);
+          }
+          // Owned by root however it was made.
+          fs.chownSync(tmp, 0, 0);
+          if (fs.lstatSync(tmp).isDirectory()) {
+            for (const entry of fs.readdirSync(tmp, { recursive: true })) fs.lchownSync(path.join(tmp, entry), 0, 0);
+          }
+          fs.rmSync(dest, { recursive: true, force: true });
+          fs.renameSync(tmp, dest);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+        console.log(`Shared ${hasContent ? "content" : process.env.SHARE_PATH} as ${dest} (root-owned, read-only to other users)`);
+      shell: sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}
+    - env:
+        HARNESS_REPO: cgwalters-forge/cgwalters-devspace-sandbox
+        HARNESS_SHA: 13308dc5480bc9f89dbf4b9abfabc7972222db8e
+        HARNESS_SHARE: /usr/local/share/bot-harness
+      name: Build bot-harness at a pinned commit
       run: |-
-        printf '%s' "$AGENT_STUB" | sudo tee /usr/local/bin/agent-stub >/dev/null
-        sudo chmod 0755 /usr/local/bin/agent-stub
+        set -euo pipefail
+        src="$RUNNER_TEMP/bot-harness"
+        git init -q "$src"
+        git -C "$src" fetch -q --depth 1 "https://github.com/$HARNESS_REPO" "$HARNESS_SHA"
+        git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+        test "$(git -C "$src" rev-parse HEAD)" = "$HARNESS_SHA"
+        cargo build --manifest-path "$src/Cargo.toml" --release --locked -p bot-harness
+        sudo install -m 0755 "$src/target/release/bot-harness" "$src/target/release/fake-acp-agent" /usr/local/bin/
+        sudo install -d -m 0755 "$HARNESS_SHARE"
+        sudo install -m 0644 "$src/agent/redact.mjs" "$HARNESS_SHARE/"
       shell: bash
     - name: Secure the host (generated)
       run: |
@@ -1085,7 +1685,9 @@ jobs:
       run: |
         const CONFIG = {
           "handoff": {
-            "include": [],
+            "include": [
+              ".git"
+            ],
             "workspace": "tracked"
           },
           "lockRunnerSudo": true,
@@ -1250,30 +1852,49 @@ jobs:
         console.log(run("sudo", ["-l", "-U", runner]).stdout);
       shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}
     - env:
+        AGENT: fake
+        AGENTS: /etc/agent-share/agent-agents.toml
+        BUDGET: '500'
+        HARNESS_SHARE: /usr/local/share/bot-harness
+        POLICY: /etc/agent-share/agent-policy.toml
         PROMPT: /etc/agent-share/agentskills/review.md
-        RUNNER_SANDBOX_ENV: PROMPT
+        RUNNER_SANDBOX_ENV: AGENT,AGENTS,BUDGET,HARNESS_SHARE,POLICY,PROMPT,TIMEOUT_MINUTES
+        TIMEOUT_MINUTES: '10'
       id: agent
       name: Run the agent
-      run: /usr/local/bin/agent-stub "$PROMPT"
+      run: node /etc/agent-share/agent-run.cjs
       shell: /usr/local/bin/runner-sandbox-exec {0}
-    - id: stage-agent-output
+      timeout-minutes: 13
+    - id: stage-agent-run
       if: always()
-      name: Stage review.md as agent-output (generated)
-      run: /usr/local/bin/runner-sandbox-exec --stage agent-output review.md
+      name: Stage agent-run as agent-run (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage agent-run agent-run
+      shell: bash
+    - id: stage-agent-transcript
+      if: always()
+      name: Stage agent-transcript as agent-transcript (generated)
+      run: /usr/local/bin/runner-sandbox-exec --stage agent-transcript agent-transcript
       shell: bash
     - id: runner-sandbox-seal
       if: always()
       name: Seal the sandbox (generated)
       run: /usr/local/bin/runner-sandbox-exec --seal
       shell: bash
-    - if: '!cancelled() && steps.stage-agent-output.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
-      name: Upload agent-output (generated)
+    - if: '!cancelled() && steps.stage-agent-run.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
+      name: Upload agent-run (generated)
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         if-no-files-found: error
-        name: agent-output
-        path: /run/runner-sandbox/staged/agent-output
-    timeout-minutes: 30
+        name: agent-run
+        path: /run/runner-sandbox/staged/agent-run
+    - if: '!cancelled() && steps.stage-agent-transcript.outcome == ''success'' && steps.runner-sandbox-seal.outcome == ''success'''
+      name: Upload agent-transcript (generated)
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        if-no-files-found: error
+        name: agent-transcript
+        path: /run/runner-sandbox/staged/agent-transcript
+    timeout-minutes: 45
 name: Agent review
 on:
   workflow_call: {}

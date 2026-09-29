@@ -315,8 +315,10 @@ comes from the pull request's own checkout, so its author wrote it
 
 **Proof:** `sandbox-test` step "Read the shares, and fail to change them",
 and the `share-symlink` steps that try to share `/etc/shadow` through a
-symlink. `agent-review.lock.yml`, whose stub agent fails if it can rewrite
-its prompt.
+symlink. `agent-review.lock.yml`, whose scripted agent tries to rewrite
+its prompt and add to a share, among other escapes; the
+`agent-review-artifacts` job fails unless the transcript shows every
+attempt failed.
 
 ### R7. What leaves the sandbox is validated data
 
@@ -536,7 +538,11 @@ Artifacts, caches and staged outputs the sandbox produced are untrusted
 data wherever they go, in later steps, jobs and runs. In particular a cache
 saved from sandbox output, or by a `pull_request_target` run or a workflow
 that isn't compiled, must never be restored into a workspace that runner
-executes, since that would be an escape across runs.
+executes, since that would be an escape across runs. An agent's run
+summary and transcript are such data too: bot-harness writes them as the
+sandbox user, next to the agent, so an agent that doesn't cooperate can
+rewrite them, and what they say about permissions, budget and redaction
+holds only for one that does.
 
 **Status:** not enforced
 ([#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20)).
