@@ -44,6 +44,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Unit tests of the runtime scripts
+        run: node --test 'tests/runtime/*.test.cjs'
       # Also catches an expression in an embedded runtime script, which
       # Actions would expand as the step starts.
       - name: Lint the workflows
