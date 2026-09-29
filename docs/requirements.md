@@ -198,16 +198,47 @@ a step's `shell:` or `working-directory`, a job's `container:`, `defaults`
 or `services`, workflow- or job-level `env:`, and a `uses:` in `steps` that
 the shim can't run.
 
-**Status:** holds, with the gap below.
+**Status:** holds. Besides matching each lock file to its source, `wfc
+check` checks the output itself (`src/shape.rs`), so a
+source that builds its own record instead of going through `gha.compile`
+fails too. It requires exactly what the compiler emits rather than
+refusing what it knows to be dangerous: every job has exactly one enter
+step, byte for byte what `runtime/` makes it, with the configuration the
+compiler writes (a sandbox user that is neither the runner nor root, the
+workspace, a valid hand-off, the sudo lock whenever steps follow the
+seal), after the generated secure-host step; every step up to the one
+generated seal step runs through the step wrapper, has only the keys such
+a step has and references no secret or token; every step after the seal
+requires it to have succeeded and is held to what gha.ncl's `PublishStep`
+refuses (unknown keys, unpinned actions, sandboxed steps' outputs in
+`run`, `working-directory`, `with` or `env`, untrusted text in scripts);
+and jobs and workflows have only the keys gha.ncl's contracts let through,
+so a key GitHub adds later is refused until the compiler knows it. Any
+other file in `.github/workflows/` must be listed, with its reason, in
+`.github/uncompiled-workflows` (here, `ci.yml`), and every lock file needs
+a source. This proves the repository's own tree; that the tree `ci` runs
+the check from is trustworthy is
+[#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26).
 
 **Proof:** the reject tests in `tests/reject/` (`shell-override`,
-`working-directory`, `job-container`, `job-defaults`, and the others), which
-`wfc check` requires to fail with their expected message,
-`job-services`, `job-env` and `workflow-env` among them. Gap:
-`wfc check` proves each lock file matches its source, not that every
-workflow in `.github/workflows/` is a lock file or that a source went
-through `gha.compile` unmodified
-([#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13)).
+`working-directory`, `job-container`, `job-defaults`, and the others),
+which `wfc check` requires to fail with their expected
+message, `job-services`, `job-env` and `workflow-env` among them; and
+`tests/shape.rs`, where a hand-built workflow of the
+compiled shape passes and each way out is found: an action, a plain shell,
+`working-directory` or an unknown key mid-sandbox, a `--stage` that runs
+more or carries `env`, `NODE_OPTIONS` for the wrapper, a second seal id,
+publish steps that skip or escape the seal condition, a job or workflow
+`env`, job `container`, `services`, `defaults`, `uses` or an unknown key,
+a secret or the token in a sandboxed step, a publish step that is
+unpinned, has an unknown key, uses sandboxed steps' outputs or expands
+event text, a changed, skippable or missing enter, secure-host or seal
+step, a seal before entering, and a CONFIG with the runner or root as
+sandbox user, another workspace, a hand-off out of it, no sudo lock before
+publish steps or an extra key; and, for the tree, an unlisted or `.YML`
+workflow, an orphan lock file, and a listed workflow without its reason or
+that doesn't exist. `tests/reject/sandbox-user-*.ncl` refuse the runner
+and root as `sandbox.user`.
 
 ### R2. A sandboxed step runs as another user, in a session of its own
 

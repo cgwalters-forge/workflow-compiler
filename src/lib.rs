@@ -6,6 +6,7 @@
 pub mod actions;
 pub mod nickel;
 pub mod repo;
+pub mod shape;
 
 use std::collections::{BTreeMap, btree_map};
 use std::path::Path;
@@ -26,6 +27,8 @@ pub const REJECT_DIR: &str = "tests/reject";
 /// actions from tests/actions/, for one) check its output without making
 /// a workflow of it.
 pub const ACCEPT_DIR: &str = "tests/accept";
+/// Workflows in [`LOCKS_DIR`] that aren't compiled, each with its reason.
+pub const UNCOMPILED: &str = ".github/uncompiled-workflows";
 /// How to regenerate what `compile` writes, from the repository root.
 pub const REGENERATE: &str = "cargo run -- compile";
 /// The prefix of a reject test's expected message.
@@ -149,6 +152,7 @@ fn check(root: &Repo) -> Result<Vec<String>> {
             }
         }
     }
+    problems.extend(shape::check_tree(root)?);
     let rejects = root.list(REJECT_DIR, ".ncl")?;
     for source in &rejects {
         let text = root.read(source)?.unwrap_or_default();

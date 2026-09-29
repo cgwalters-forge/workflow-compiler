@@ -210,9 +210,16 @@ The compiler is `wfc`, a Rust program that embeds nickel
 
 ```sh
 cargo run -- compile  # write .github/workflows/*.lock.yml
-cargo run -- check    # fail on a stale lock file or an accepted reject test
+cargo run -- check    # fail on a stale lock file, an accepted reject test,
+                      # or a workflow that isn't compiled (see below)
 cargo test            # wfc's own tests, and `check` of this repository
 ```
+
+`check` also checks every workflow in `.github/workflows/`: a lock file
+must have a source and the compiled shape (`src/shape.rs`: the generated
+enter and seal steps, byte for byte, and nothing between them that
+leaves the wrapper), and anything else must be listed, with its reason,
+in `.github/uncompiled-workflows`.
 
 `compile` also fetches new actions' metadata from GitHub; `check` never
 uses the network.
@@ -261,7 +268,6 @@ the task compiler that will produce this compiler's input):
 - [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36) `agent_run` with real inference through praxis run tokens (P1)
 - [#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4) agent-run as a compiler macro or a composite action (P1)
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
-- [#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13) the stale-lock check doesn't prove every workflow is compiled (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20) caches saved from sandbox output and restored in `runner_steps` (P1)
