@@ -1,7 +1,7 @@
-//! This repository's own check: every lock file matches its source, every
-//! accept test compiles to its expected output, every reject test fails
-//! with its message, and actions.lock.json matches the action.yml files it
-//! holds.
+//! This repository's own check: every lock file matches its source and
+//! has the compiled shape, every accept test compiles to its expected
+//! output, every reject test fails with its message, and
+//! actions.lock.json matches the action.yml files it holds.
 
 use std::process::Command;
 

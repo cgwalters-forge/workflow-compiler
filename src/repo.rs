@@ -37,6 +37,16 @@ impl Repo {
         }
     }
 
+    /// Whether `rel` is a regular file, not following symlinks; false if
+    /// it doesn't exist.
+    pub fn is_file(&self, rel: &str) -> Result<bool> {
+        match std::fs::symlink_metadata(self.path(rel)) {
+            Ok(meta) => Ok(meta.is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("reading {rel}")),
+        }
+    }
+
     /// The names in the directory `rel` that end in `suffix`, as paths
     /// relative to the root, sorted; none if it doesn't exist.
     pub fn list(&self, rel: &str, suffix: &str) -> Result<Vec<String>> {

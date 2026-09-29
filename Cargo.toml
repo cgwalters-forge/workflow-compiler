@@ -24,6 +24,9 @@ sha2 = "0.11"
 # Fetches the action.yml of actions to lock; `check` never uses it.
 ureq = "3"
 
+[dev-dependencies]
+tempfile = "3"
+
 # nickel's evaluator is slow unoptimized, and `cargo test` and
 # `cargo run -- compile` evaluate every source.
 [profile.dev.package."*"]
