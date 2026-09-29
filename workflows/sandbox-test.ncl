@@ -160,6 +160,38 @@ gha.compile {
         "continue-on-error" = true,
         run = m%"printf 'x y<<EOF\nsomething\nEOF\n' >>"$GITHUB_OUTPUT""%,
       },
+      # Workflow commands on standard output and error: all but annotations
+      # are passed on neutralized.
+      {
+        name = "Issue workflow commands",
+        id = "commands",
+        # Spelled with $c so actionlint doesn't flag the deprecated commands.
+        run = m%"
+          c=::
+          echo "${c}set-output name=smuggled::1"
+          echo "  ${c}save-state name=smuggled::1"
+          echo "${c}add-mask::runner-sandbox"
+          echo "${c}add-path::/tmp/sandbox-bin"
+          echo "${c}set-env name=SMUGGLED::1"
+          echo "${c}stop-commands::sandbox-token" >&2
+          printf 'text\r%sset-output name=cr::1\n' "$c"
+          echo "legacy ##[set-output name=legacy;]1"
+          echo "${c}warning::an annotation from the sandbox, which is allowed"
+        "%,
+      },
+      {
+        name = "No command took effect",
+        env = {
+          SMUGGLED = "${{ steps.commands.outputs.smuggled }}",
+          CR = "${{ steps.commands.outputs.cr }}",
+          LEGACY = "${{ steps.commands.outputs.legacy }}",
+        },
+        run = m%"
+          test -z "$SMUGGLED$CR$LEGACY"
+          # Masking would have turned the name into *** in this log.
+          echo "the sandbox user is runner-sandbox"
+        "%,
+      },
       {
         name = "Leave a process behind",
         run = m%"setsid sleep 600 </dev/null >/dev/null 2>&1 & echo "started $!""%,
