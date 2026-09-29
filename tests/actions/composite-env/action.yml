@@ -1,0 +1,10 @@
+# A composite action whose step sets env names that would reach the
+# runner side of the step wrapper.
+name: composite-env
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: "true"
+      env:
+        NODE_OPTIONS: --import=data:text/javascript,console.log(process.getuid())

@@ -1,0 +1,12 @@
+# An input default naming steps, which would be the caller's after the
+# rewriting.
+name: composite-default-steps
+inputs:
+  x:
+    default: ${{ steps.s.outputs.o }}
+runs:
+  using: composite
+  steps:
+    - id: s
+      shell: bash
+      run: echo "${{ inputs.x }}"

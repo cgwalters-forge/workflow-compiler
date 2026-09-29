@@ -1,6 +1,7 @@
 # Real actions from the marketplace, run in the sandbox through the shim:
-# a linter and a setup action that installs into the tool cache and adds
-# to PATH. Also checks that what a step writes to GITHUB_ENV and
+# a linter, a setup action that installs into the tool cache and adds to
+# PATH, and a composite action (a spell checker that downloads its binary
+# into RUNNER_TEMP and runs a script from its own directory). Also checks that what a step writes to GITHUB_ENV and
 # GITHUB_PATH reaches later sandboxed steps and never the runner, and
 # that outputs in the heredoc form come through without a way to smuggle
 # another name. ci.yml runs it; compiled to
@@ -9,6 +10,7 @@ let gha = import "../lib/gha.ncl" in
 let checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in # v7.0.1
 let markdownlint = "DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff" in # v24.2.0
 let setup_node = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020" in # v7.0.0
+let typos = "crate-ci/typos@00f422f3b19c57bc6338715ebfe3316d38768461" in # v1.50.3, a composite action
 
 gha.compile {
   name = "Actions test",
@@ -35,6 +37,22 @@ gha.compile {
         id = "node",
         uses = setup_node,
         with = { node-version = "22", package-manager-cache = "false" },
+      },
+      {
+        name = "Spell-check a clean file with a composite action",
+        uses = typos,
+        with.files = "LICENSE-MIT",
+      },
+      {
+        name = "Write a misspelled file",
+        run = m%"echo "This is teh wrong spelling." >misspelled.txt"%,
+      },
+      {
+        name = "The composite action finds it",
+        id = "typo",
+        "continue-on-error" = true,
+        uses = typos,
+        with.files = "misspelled.txt",
       },
       {
         name = "setup-node's PATH and outputs reach later sandboxed steps",
@@ -88,8 +106,9 @@ gha.compile {
         env = {
           DENIED = "${{ steps.denied-env.outcome }}",
           HEREDOC = "${{ steps.bad-heredoc.outcome }}",
+          TYPO = "${{ steps.typo.outcome }}",
         },
-        run = m%"test "$DENIED $HEREDOC" = "failure failure""%,
+        run = m%"test "$DENIED $HEREDOC $TYPO" = "failure failure failure""%,
       },
     ],
     publish_steps = [
