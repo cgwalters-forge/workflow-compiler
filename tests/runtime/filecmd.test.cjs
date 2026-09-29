@@ -38,3 +38,52 @@ test("format round-trips any value, and a value can't start another name", () =>
   }
   assert.throws(() => format("bad name", "x"), /invalid name/);
 });
+
+test("neutralizes workflow commands but annotations", () => {
+  const { neutralize } = require("../../runtime/filecmd.cjs");
+  const cases = [
+    ["plain output", "plain output"],
+    ["::warning file=a.md,line=1::bad", "::warning file=a.md,line=1::bad"],
+    ["::ERROR::bad", "::ERROR::bad"],
+    ["::notice::fyi", "::notice::fyi"],
+    ["::debug::details", "::debug::details"],
+    ["::set-output name=x::1", "[sandbox] ::set-output name=x::1"],
+    ["  ::add-mask::secret", "  [sandbox] ::add-mask::secret"],
+    ["\t::stop-commands::tok", "\t[sandbox] ::stop-commands::tok"],
+    ["::save-state name=s::1", "[sandbox] ::save-state name=s::1"],
+    ["::set-env name=X::1", "[sandbox] ::set-env name=X::1"],
+    ["::add-path::/tmp", "[sandbox] ::add-path::/tmp"],
+    ["::add-matcher::m.json", "[sandbox] ::add-matcher::m.json"],
+    ["::group::title", "::group::title"],
+    ["::endgroup::", "::endgroup::"],
+    ["\u0085::add-mask::x", "\u0085[sandbox] ::add-mask::x"],
+    ["::echo::on", "[sandbox] ::echo::on"],
+    ["::::", "[sandbox] ::::"],
+    ["text ##[set-output name=x;]1", "text ## [set-output name=x;]1"],
+    ["::warning::then ##[add-mask]x", "::warning::then ## [add-mask]x"],
+  ];
+  for (const [line, want] of cases) assert.equal(neutralize(line), want, line);
+});
+
+test("the filter follows the runner's line breaks across chunks", () => {
+  const { CommandFilter } = require("../../runtime/filecmd.cjs");
+  const run = (chunks) => {
+    const f = new CommandFilter();
+    return chunks.map((c) => f.push(Buffer.isBuffer(c) ? c : Buffer.from(c))).join("") + f.end();
+  };
+  const cases = [
+    [["a\n::set-output name=x::1\n"], "a\n[sandbox] ::set-output name=x::1\n"],
+    [["a\r::add-mask::y\r\n"], "a\r[sandbox] ::add-mask::y\r\n"],
+    [["::add-", "mask::y\n"], "[sandbox] ::add-mask::y\n"],
+    [["a\r", "\n::echo::on"], "a\r\n[sandbox] ::echo::on"],
+    [["x #", "#[set-env]y\n"], "x ## [set-env]y\n"],
+    // A character split between chunks.
+    [[Buffer.from([0xc3]), Buffer.from([0xa9, 0x0a])], "é\n"],
+  ];
+  for (const [chunks, want] of cases) assert.equal(run(chunks), want, JSON.stringify(chunks));
+  // A line longer than what the filter holds is passed on in pieces, and
+  // a command can't hide in its tail.
+  const long = "x".repeat(70 * 1024);
+  const out = run([long, "##[set-output name=x;]1\n"]);
+  assert.equal(out, `${long}## [set-output name=x;]1\n`);
+});
