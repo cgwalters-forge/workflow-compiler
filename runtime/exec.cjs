@@ -24,7 +24,7 @@
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
-const { parse, format } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
+const { parse, format, neutralize } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
 
 const RUN = "/usr/local/libexec/runner-sandbox-run";
 const SUDO = "/usr/bin/sudo";
@@ -35,8 +35,10 @@ const CONTEXT_ENV = [
 ];
 const USAGE = "usage: runner-sandbox-exec SCRIPT | --action SPEC | --action-path USES SCRIPT | --stage NAME PATH | --seal";
 
+// MESSAGE can quote what the sandbox wrote, so its lines go through the
+// same filter as the sandbox's own output.
 function fail(message) {
-  console.error(`runner-sandbox-exec: ${message}`);
+  console.error(String(message).split(/\r\n|\r|\n/).map((l) => neutralize(`runner-sandbox-exec: ${l}`)).join("\n"));
   process.exit(125);
 }
 
