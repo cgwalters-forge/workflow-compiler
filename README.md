@@ -206,11 +206,16 @@ composite action runs as `runner` and can't constrain the job around it
 
 ```sh
 node compile.mjs          # write .github/workflows/*.lock.yml
-node compile.mjs --check  # fail on a stale lock file or an accepted reject test
+node compile.mjs --check  # fail on a stale lock file, an accepted reject test,
+                          # or a workflow that isn't compiled (see below)
 ```
 
 It needs `nickel` on `PATH` (or `$NICKEL`); `ci.yml` shows how to fetch the
-pinned release. Sandboxed steps need `run0`, so systemd 256 or later:
+pinned release. `--check` also checks every workflow in `.github/workflows/`:
+a lock file must have a source and the compiled shape (`lib/check-lock.mjs`:
+the generated enter and seal steps, byte for byte, and nothing between
+them that leaves the wrapper), and anything else must be listed, with its
+reason, in `.github/uncompiled-workflows`. Sandboxed steps need `run0`, so systemd 256 or later:
 ubuntu-26.04 and RHEL 10, not ubuntu-24.04 ([#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6)).
 
 `wfc/` is the Rust front end that will replace `compile.mjs` and the
@@ -271,7 +276,6 @@ the task compiler that will produce this compiler's input):
 - [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36) `agent_run` with real inference through praxis run tokens (P1)
 - [#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4) agent-run as a compiler macro or a composite action (P1)
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
-- [#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13) the stale-lock check doesn't prove every workflow is compiled (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20) caches saved from sandbox output and restored in `runner_steps` (P1)

@@ -197,16 +197,31 @@ a step's `shell:` or `working-directory`, a job's `container:`, `defaults`
 or `services`, workflow- or job-level `env:`, and a `uses:` in `steps` that
 the shim can't run.
 
-**Status:** holds, with the gap below.
+**Status:** holds. Besides matching each lock file to its source,
+`node compile.mjs --check` checks the output itself
+(`lib/check-lock.mjs`), so a source that builds its own record instead of
+going through `gha.compile` fails too: every job has exactly one enter
+step, byte for byte what `runtime/` makes it, after the secure-host step;
+every step up to the one seal step runs through the step wrapper with no
+action and no environment for its runner side; every step after the seal
+requires it to have succeeded; and no job or workflow sets `env`,
+`defaults`, `container`, `services` or a job-level `uses`. Any other file
+in `.github/workflows/` must be listed, with its reason, in
+`.github/uncompiled-workflows` (here, `ci.yml`), and every lock file needs
+a source. This proves the repository's own tree; that the tree `ci` runs
+the check from is trustworthy is
+[#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26).
 
 **Proof:** the reject tests in `tests/reject/` (`shell-override`,
 `working-directory`, `job-container`, `job-defaults`, and the others), which
 `node compile.mjs --check` requires to fail with their expected message,
-`job-services`, `job-env` and `workflow-env` among them. Gap:
-`--check` proves each lock file matches its source, not that every
-workflow in `.github/workflows/` is a lock file or that a source went
-through `gha.compile` unmodified
-([#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13)).
+`job-services`, `job-env` and `workflow-env` among them; and
+`tests/runtime/check-lock.test.cjs`, where a hand-built workflow of the
+compiled shape passes and each way out (an action or a plain shell
+mid-sandbox, a `--stage` that runs more, `NODE_OPTIONS` for the wrapper,
+a second seal id, publish steps that skip or escape the seal condition, a
+job or workflow `env`, a job container, an enter step that isn't the
+compiler's) is found.
 
 ### R2. A sandboxed step runs as another user, in a session of its own
 
