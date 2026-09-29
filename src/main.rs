@@ -24,8 +24,10 @@ enum Command {
     /// in actions.lock.json.
     Compile(Repo),
     /// Fail if a lock file or expected output is stale or hand-edited, if
-    /// actions.lock.json doesn't match the action.yml files it holds, or
-    /// if a source in tests/reject/ compiles.
+    /// actions.lock.json doesn't match the action.yml files it holds, if
+    /// a source in tests/reject/ compiles, or if a workflow in
+    /// .github/workflows/ is neither a lock file with the compiled shape
+    /// nor listed in .github/uncompiled-workflows.
     Check(Repo),
 }
 

@@ -18,11 +18,11 @@ use cap_std_ext::cap_std::ambient_authority;
 use cap_std_ext::cap_std::fs::{Dir, OpenOptions};
 use cap_std_ext::dirext::CapStdExtDirExt;
 
-use crate::{LOCKS_DIR, SOURCES_DIR, actions};
+use crate::{LOCKS_DIR, SOURCES_DIR, UNCOMPILED, actions};
 
 /// What a compile may read, relative to the repository root: the
 /// compiler's library and runtime, which the lock files embed, the
-/// sources, the tests, the actions' metadata, and the lock files `check`
+/// sources, the tests, the actions' metadata, and the workflows `check`
 /// compares with. Not `.git`, nor anything else in the checkout.
 pub const READABLE: &[&str] = &[
     "lib",
@@ -31,6 +31,7 @@ pub const READABLE: &[&str] = &[
     "tests",
     actions::LOCK_FILE,
     LOCKS_DIR,
+    UNCOMPILED,
 ];
 
 /// The largest file wfc reads. Everything it reads is a source, a script
@@ -137,6 +138,20 @@ impl Repo {
             bail!("{rel} is larger than {MAX_FILE_SIZE} bytes");
         }
         Ok(Some(text))
+    }
+
+    /// Whether `rel` is a regular file, not following symlinks; false if
+    /// it doesn't exist.
+    pub fn is_file(&self, rel: &str) -> Result<bool> {
+        let parts = components(rel)?;
+        let (name, parents) = parts.split_last().expect("components is never empty");
+        let Some(dir) = self.open_dir(rel, parents)? else {
+            return Ok(false);
+        };
+        let meta = dir
+            .symlink_metadata_optional(name)
+            .with_context(|| format!("reading {rel}"))?;
+        Ok(meta.is_some_and(|m| m.is_file()))
     }
 
     /// The names in the directory `rel` that end in `suffix`, as paths
