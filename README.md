@@ -237,7 +237,6 @@ the task compiler that will produce this compiler's input):
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
 - [#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13) the stale-lock check doesn't prove every workflow is compiled (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
-- [#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17) workflow commands on a sandboxed step's standard output (P1)
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20) caches saved from sandbox output and restored in `runner_steps` (P1)
 - [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25) expressions from issues, comments and pull requests in privileged `run:` steps (P1)

@@ -30,7 +30,7 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const CONFIG = JSON.parse(fs.readFileSync("/etc/runner-sandbox/config.json", "utf8"));
 const STEPS_DIR = "/run/runner-sandbox/steps";
@@ -42,7 +42,7 @@ const STATE_DIR = "/run/runner-sandbox/state";
 // Where the enter step fetched the actions, root-owned.
 const ACTIONS_DIR = "/opt/runner-sandbox/actions";
 const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
-const { parse: parseFileCommand } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
+const { parse: parseFileCommand, CommandFilter } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
 // owner/repo[/path]@<40 hex>, as the compiler pins them.
 const USES_RE = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)((?:\/[A-Za-z0-9_.-]+)*)@([0-9a-f]{40})$/;
 const RUNNER_ARCH = { x64: "X64", arm64: "ARM64" }[process.arch] ?? process.arch.toUpperCase();
@@ -359,28 +359,48 @@ const argv = [
   "--", "env", ...SUDO_VARS.flatMap((v) => ["-u", v]), "--",
   ...command,
 ];
-// run0 hands stdio to PID 1 over D-Bus, which accepts pipes but not every
-// file type, so give it an empty pipe rather than /dev/null.
-const r = spawnSync("run0", argv, { stdio: ["pipe", "inherit", "inherit"], input: "" });
-const status = r.status ?? 125;
-
-// Every process of the step is gone after this, so none can touch the
-// files read below.
-const stopAfter = stopSandboxProcesses();
-let result;
-try {
-  if (stopAfter) throw new Error(stopAfter);
-  const read = Object.fromEntries(Object.keys(FILES).map((f) => [f, readSandboxFile(path.join(outDir, f))]));
-  updateEnvStore(read.env, read.path);
-  if (stateKey !== null) {
-    const saved = Object.fromEntries(parseFileCommand(read.state, "GITHUB_STATE"));
-    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(STATE_DIR, `${stateKey}.json`), JSON.stringify({ ...state, ...saved }), { mode: 0o600 });
-  }
-  result = { status, output: read.output, summary: read.summary };
-} catch (e) {
-  result = { status: 125, error: e.message };
+// Runs run0 with ARGV, passing on its output through a CommandFilter per
+// stream, and resolves to its exit status. run0 hands stdio to PID 1 over
+// D-Bus, which accepts pipes but not every file type, so its stdin is an
+// empty pipe rather than /dev/null.
+function runFiltered(args) {
+  return new Promise((resolve) => {
+    const child = spawn("run0", args, { stdio: ["pipe", "pipe", "pipe"] });
+    child.stdin.end();
+    for (const [from, to] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
+      const filter = new CommandFilter();
+      from.on("data", (chunk) => to.write(filter.push(chunk)));
+      from.on("end", () => to.write(filter.end()));
+    }
+    child.on("error", (e) => {
+      console.error(`runner-sandbox-run: run0: ${e.message}`);
+      resolve(125);
+    });
+    child.on("close", (code) => resolve(code ?? 125));
+  });
 }
-fs.rmSync(stepDir, { recursive: true, force: true });
-writeResult(result);
-process.exit(result.status);
+
+(async () => {
+  const status = await runFiltered(argv);
+
+  // Every process of the step is gone after this, so none can touch the
+  // files read below.
+  const stopAfter = stopSandboxProcesses();
+  let result;
+  try {
+    if (stopAfter) throw new Error(stopAfter);
+    const read = Object.fromEntries(Object.keys(FILES).map((f) => [f, readSandboxFile(path.join(outDir, f))]));
+    updateEnvStore(read.env, read.path);
+    if (stateKey !== null) {
+      const saved = Object.fromEntries(parseFileCommand(read.state, "GITHUB_STATE"));
+      fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(STATE_DIR, `${stateKey}.json`), JSON.stringify({ ...state, ...saved }), { mode: 0o600 });
+    }
+    result = { status, output: read.output, summary: read.summary };
+  } catch (e) {
+    result = { status: 125, error: e.message };
+  }
+  fs.rmSync(stepDir, { recursive: true, force: true });
+  writeResult(result);
+  process.exitCode = result.status;
+})();
