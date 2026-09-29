@@ -20,11 +20,13 @@ let EXEC = "/usr/local/bin/runner-sandbox-exec" in
 let USER_RE = "^[a-z_][a-z0-9_-]{0,30}$" in
 # Where `share` runner steps publish (the sandbox-share action has it too).
 let SHARE_DIR = "/etc/agent-share" in
-# The runner image of a job that doesn't set `runs-on`.
+# The runner image of a job that doesn't set `runs-on`, and the
+# compiler's own actions (github.com/cgwalters-forge/actions), which
+# generated steps use, all from one commit. Renovate bumps both
+# (renovate.json; "Updating pinned versions" in the README), the actions
+# once the pin follows main rather than cgwalters-forge/actions#7's head
+# (#47).
 let DEFAULT_RUNNER = "ubuntu-26.04" in
-# The compiler's own actions (github.com/cgwalters-forge/actions), which
-# generated steps use, all from one commit: cgwalters-forge/actions#7's
-# head until it merges (#47).
 let SHARED_ACTIONS = "cgwalters-forge/actions@f1cc343b8404c22aadbc8c5a7d0923dae4015179" in # cgwalters-forge/actions#7
 
 let validator = fun pred msg =>

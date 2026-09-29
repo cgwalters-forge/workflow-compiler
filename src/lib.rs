@@ -7,6 +7,7 @@
 pub mod actions;
 pub mod extract;
 pub mod nickel;
+pub mod pins;
 pub mod repo;
 pub mod scripts;
 pub mod shape;
@@ -156,6 +157,7 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     problems.extend(shape::check_tree(root)?);
+    problems.extend(pins::check(root)?);
     // The scripts the sources import; a source that failed to load was
     // reported above.
     let mut scripts = BTreeSet::new();

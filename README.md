@@ -258,6 +258,41 @@ later: ubuntu-26.04, which a job runs on unless it sets `runs-on`, and
 RHEL 10, not ubuntu-24.04
 ([#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6)).
 
+## Updating pinned versions
+
+Everything a job depends on is pinned, and [Renovate](https://docs.renovatebot.com/)
+keeps the pins current, with the managers in `renovate.json`. Like
+[gh-aw](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/compilation-process.md)
+does for its lock files, updates go to the sources and the lock files are
+recompiled from them; a bot never edits a lock file. The rules:
+
+- An action is pinned in a source or in `lib/` as the string
+  `"owner/repo[/path]@<full commit sha>"`, followed on its line by a
+  comment naming what the commit is: a release tag (`# v7.0.1`), which
+  Renovate follows through the repository's tags, or `# main`, a branch,
+  which it follows commit by commit. `wfc check` refuses a pin without
+  that comment. The compiler's own actions come from one such pin,
+  `SHARED_ACTIONS` in `lib/gha.ncl`.
+- A runner image is an `"ubuntu-NN.NN"` string; `DEFAULT_RUNNER` in
+  `lib/gha.ncl` is the one jobs get unless they set `runs-on`. Renovate
+  bumps these through its GitHub runners datasource.
+- The hand-written workflows (`ci.yml`, `trusted-check.yml`) are updated
+  by Renovate's own GitHub Actions manager, and `.github/workflows/*.lock.yml`
+  are ignored: they are outputs.
+- After a bump, `wfc check` fails until `cargo run -- compile` has
+  regenerated the lock files and locked the new commit's `action.yml` in
+  `actions.lock.json`, so a bump can't merge without its compiled result.
+  Renovate's hosted app can't run the compiler (`postUpgradeTasks` needs a
+  self-hosted Renovate), so a maintainer runs it on the Renovate branch and
+  pushes the result.
+- `nickel-lang-core` is pinned exactly in `Cargo.toml` and a bump of it
+  can change the output, so it goes the same way.
+- Dependabot can't read the sources, and its GitHub Actions updater edits
+  any YAML file in `.github/workflows/`, lock files included. A repository
+  that uses it for its other workflows excludes the lock files
+  (`exclude-paths: [".github/workflows/*.lock.yml"]`); a Dependabot change
+  to a lock file fails `wfc check` and is closed, not merged.
+
 ## Status and roadmap
 
 This is a proof of concept. What works now, checked by `ci` on every pull
@@ -306,6 +341,7 @@ the task compiler that will produce this compiler's input):
 - [#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2) post-steps of `runner_steps` actions (P2)
 - [#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6) ubuntu-24.04, which has no `run0` (P2)
 - [#46](https://github.com/cgwalters-forge/workflow-compiler/issues/46) `fetch-actions.cjs` as a shared action (P2)
+- [#48](https://github.com/cgwalters-forge/workflow-compiler/issues/48) recompiling the lock files on Renovate branches (P2)
 - [#9](https://github.com/cgwalters-forge/workflow-compiler/issues/9) replacing the runner's last sudo rule (P2)
 - [#10](https://github.com/cgwalters-forge/workflow-compiler/issues/10) blocking the cloud metadata service for the sandbox (P2)
 - [#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18) a size cap on staged outputs (P2)
