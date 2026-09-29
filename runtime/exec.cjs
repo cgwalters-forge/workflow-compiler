@@ -7,8 +7,10 @@
 // the step's outputs and summary into the runner's own files, accepting only
 // plain name=value output lines.
 //
-// `runner-sandbox-exec --collect NAME PATH` has the root side copy PATH
-// out of the sandbox for a generated upload step instead.
+// `runner-sandbox-exec --stage NAME PATH` has the root side copy PATH out
+// of the sandbox for a generated stage step instead, and
+// `runner-sandbox-exec --seal` has it seal the sandbox after the last
+// sandboxed step.
 "use strict";
 const fs = require("node:fs");
 const crypto = require("node:crypto");
@@ -28,10 +30,10 @@ function fail(message) {
   process.exit(125);
 }
 
-const collect = process.argv[2] === "--collect";
-const scriptPath = process.argv[2];
-if (collect ? process.argv.length !== 5 : !scriptPath || process.argv.length !== 3) {
-  fail("usage: runner-sandbox-exec SCRIPT | --collect NAME PATH");
+const mode = process.argv[2];
+const argc = { "--stage": 5, "--seal": 3 }[mode] ?? 3;
+if (!mode || process.argv.length !== argc || (mode.startsWith("--") && !["--stage", "--seal"].includes(mode))) {
+  fail("usage: runner-sandbox-exec SCRIPT | --stage NAME PATH | --seal");
 }
 const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
 const env = {};
@@ -39,9 +41,10 @@ for (const name of [...CONTEXT_ENV, ...names]) {
   if (process.env[name] !== undefined) env[name] = process.env[name];
 }
 const id = crypto.randomBytes(16).toString("hex");
-const request = JSON.stringify(collect
-  ? { id, collect: { name: process.argv[3], path: process.argv[4] } }
-  : { id, script: fs.readFileSync(scriptPath, "utf8"), env });
+const request = JSON.stringify(
+  mode === "--stage" ? { id, stage: { name: process.argv[3], path: process.argv[4] } }
+  : mode === "--seal" ? { id, seal: true }
+  : { id, script: fs.readFileSync(mode, "utf8"), env });
 // By absolute path: the step's own env: applies to this process.
 const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
 if (r.error) fail(`running ${RUN}: ${r.error.message}`);

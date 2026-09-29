@@ -7,10 +7,14 @@
 // fields are validated, and the files the sandbox wrote are read without
 // following symlinks.
 //
-// A request {id, collect: {name, path}} instead copies PATH from the
-// sandbox's workspace to COLLECT_DIR/NAME, for a generated upload step:
-// actions like upload-artifact run as runner and follow symlinks, so they
-// must never read a path the sandbox controls.
+// A request {id, stage: {name, path}} instead copies PATH from the
+// sandbox's workspace to STAGED_DIR/NAME, for a generated stage step:
+// publish steps run as runner, and actions like upload-artifact follow
+// symlinks, so they must never read a path the sandbox controls.
+//
+// A request {id, seal: true}, from the generated step after the last
+// sandboxed step, stops the sandbox's processes for good and makes its
+// files unreadable to runner; every request after it is refused.
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
@@ -19,7 +23,15 @@ const { spawnSync } = require("node:child_process");
 const CONFIG = JSON.parse(fs.readFileSync("/etc/runner-sandbox/config.json", "utf8"));
 const STEPS_DIR = "/run/runner-sandbox/steps";
 const RESULTS_DIR = "/run/runner-sandbox/results";
-const COLLECT_DIR = "/run/runner-sandbox/collect";
+const STAGED_DIR = "/run/runner-sandbox/staged";
+const SEALED = "/run/runner-sandbox/sealed";
+// Filesystems not to look for world-writable directories on, where the
+// sandbox can leave files that outlive its steps (its /tmp and /var/tmp
+// are private to each step): kernel interfaces, not storage.
+const KERNEL_FSTYPES = new Set([
+  "proc", "sysfs", "cgroup", "cgroup2", "devpts", "securityfs", "debugfs", "tracefs",
+  "bpf", "pstore", "configfs", "fusectl", "binfmt_misc", "efivarfs", "autofs", "nsfs",
+]);
 const MAX_FILE = 1 << 20;
 const SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin";
 const SUDO_VARS = ["SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME"];
@@ -65,12 +77,12 @@ function copyTree(src, dest) {
   }
 }
 
-// Handles a collect request; the sandbox user has no process left, so
+// Handles a stage request; the sandbox user has no process left, so
 // nothing changes the tree while it is copied.
-function collect({ name, path: rel }) {
-  if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid upload name ${JSON.stringify(name)}`);
+function stage({ name, path: rel }) {
+  if (!/^[A-Za-z0-9_-]+$/.test(name ?? "")) throw new Error(`invalid stage name ${JSON.stringify(name)}`);
   if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
-    throw new Error(`invalid upload path ${JSON.stringify(rel)}`);
+    throw new Error(`invalid stage path ${JSON.stringify(rel)}`);
   }
   const src = path.join(CONFIG.workdir, rel);
   let real;
@@ -80,7 +92,7 @@ function collect({ name, path: rel }) {
     throw new Error(`${rel}: ${e.code}`);
   }
   if (real !== src) throw new Error(`${rel} goes through a symlink`);
-  const dest = path.join(COLLECT_DIR, name);
+  const dest = path.join(STAGED_DIR, name);
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { mode: 0o755 });
   try {
@@ -98,7 +110,7 @@ try {
   fail(`invalid request: ${e.message}`);
 }
 if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-if (typeof req.script !== "string" && typeof req.collect !== "object") fail("missing script");
+if (typeof req.script !== "string" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
 const env = req.env ?? {};
 for (const [k, v] of Object.entries(env)) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
@@ -118,17 +130,84 @@ function stopSandboxProcesses() {
   return r.status === 0 ? null : `could not stop the sandbox user's processes (${r.error ?? `exit ${r.status}`})`;
 }
 
+// The ids the sandbox's files can have: its own, and the subordinate ids
+// rootless podman maps its containers to (`podman unshare chown 1:1 f`
+// makes a file owned by one of them).
+function sandboxIds(file, id) {
+  const ranges = [[id, 1]];
+  const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+  for (const line of text.split("\n")) {
+    const [owner, start, count] = line.split(":");
+    if (owner === CONFIG.user || owner === String(id)) ranges.push([Number(start), Number(count)]);
+  }
+  return (n) => ranges.some(([start, count]) => n >= start && n < start + count);
+}
+
+// World-writable directories (sticky or not) on every mounted filesystem
+// but the kernel's own. Throws if one can't be searched: a seal that
+// misses a directory would leave its files to runner.
+function worldWritableDirs() {
+  const mounts = fs.readFileSync("/proc/self/mounts", "utf8").split("\n")
+    .map((l) => l.split(" "))
+    .filter((f) => f.length > 2 && !KERNEL_FSTYPES.has(f[2]))
+    .map((f) => f[1].replace(/\\040/g, " "));
+  const dirs = new Set();
+  for (const top of new Set(["/", ...mounts])) {
+    const r = spawnSync("find", [top, "-xdev", "-type", "d", "-perm", "-0002", "-print0"], { encoding: "utf8", maxBuffer: 1 << 28, stdio: ["ignore", "pipe", "pipe"] });
+    // Entries that vanish during the search (a process's /run files) are
+    // not a reason to fail; anything else, or a truncated output, is.
+    const problems = (r.stderr ?? "").split("\n").filter((l) => l && !l.endsWith("No such file or directory"));
+    if (r.error || r.signal || (r.status !== 0 && problems.length)) {
+      throw new Error(`searching ${top} for world-writable directories failed (${r.error?.message ?? r.signal ?? problems.join("; ").slice(0, 300)})`);
+    }
+    for (const d of r.stdout.split("\0").filter(Boolean)) dirs.add(d);
+  }
+  return [...dirs];
+}
+
+// Stops the sandbox for good: its processes, and runner's access to
+// whatever it left behind, so publish steps can only read staged outputs.
+function seal() {
+  fs.writeFileSync(SEALED, "", { mode: 0o644 });
+  // /var/lib/runner-sandbox (root's) holds the workspace; the home is the
+  // sandbox user's.
+  for (const dir of [path.dirname(CONFIG.workdir), CONFIG.home]) fs.chmodSync(dir, 0o700);
+  const isUid = sandboxIds("/etc/subuid", CONFIG.uid);
+  const isGid = sandboxIds("/etc/subgid", CONFIG.gid);
+  const removed = [];
+  for (const dir of worldWritableDirs()) {
+    for (const entry of fs.readdirSync(dir)) {
+      const p = path.join(dir, entry);
+      const st = fs.lstatSync(p, { throwIfNoEntry: false });
+      if (st && (isUid(st.uid) || isGid(st.gid))) {
+        fs.rmSync(p, { recursive: true, force: true });
+        removed.push(p);
+      }
+    }
+  }
+  console.log(`Sealed the sandbox${removed.length ? `; removed what it left in ${removed.join(", ")}` : ""}`);
+}
+
+function writeResult(result) {
+  fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+}
+
 const user = CONFIG.user;
+if (fs.existsSync(SEALED)) {
+  writeResult({ status: 125, error: "the sandbox is sealed: no sandboxed step can run after the seal step" });
+  process.exit(125);
+}
 const stopError = stopSandboxProcesses();
 if (stopError) fail(stopError);
-if (req.collect) {
+if (req.stage || req.seal) {
   let result = { status: 0, output: "", summary: "" };
   try {
-    collect(req.collect);
+    if (req.stage) stage(req.stage);
+    else seal();
   } catch (e) {
-    result = { status: 1, error: `upload: ${e.message}` };
+    result = { status: 1, error: `${req.stage ? "stage" : "seal"}: ${e.message}` };
   }
-  fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+  writeResult(result);
   process.exit(result.status);
 }
 const stepDir = path.join(STEPS_DIR, req.id);
@@ -178,5 +257,5 @@ try {
   result = { status: 125, error: e.message };
 }
 fs.rmSync(stepDir, { recursive: true, force: true });
-fs.writeFileSync(path.join(RESULTS_DIR, `${req.id}.json`), JSON.stringify(result), { mode: 0o644, flag: "wx" });
+writeResult(result);
 process.exit(status);

@@ -30,7 +30,14 @@ gha.compile {
       { share = { name = "config", path = "ci/config.toml" } },
     ],
     steps = [                         # as runner-sandbox, no sudo
-      { run = "make check CONFIG=/etc/agent-share/config" },
+      { run = "make check CONFIG=/etc/agent-share/config >report.txt" },
+      { upload = { name = "report", path = "report.txt" } },
+    ],
+    publish_steps = [                 # as runner, no sudo, reading staged outputs
+      {
+        run = m%"gh pr comment "$PR" --body-file %{gha.staged "report"}/report.txt"%,
+        env = { PR = "${{ github.event.pull_request.number }}", GH_TOKEN = "${{ github.token }}" },
+      },
     ],
   },
 }
@@ -45,20 +52,30 @@ The compiler turns each job into:
 2. a generated step that secures the host (`runtime/secure-host.cjs`;
    to be replaced by `cgwalters-forge/actions/secure-host-setup`, see [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5)).
 3. a generated step that enters the sandbox (`runtime/install.cjs`): it
-   creates `runner-sandbox`, gives it a copy of the workspace, and leaves
-   `runner` a single sudo rule, for the step wrapper.
+   creates `runner-sandbox`, hands it the workspace (`handoff.workspace`:
+   by default only what git tracks, plus `handoff.include`; refused if it
+   holds credentials, `runtime/handoff.cjs`), and leaves `runner` a single
+   sudo rule, for the step wrapper.
 4. its `steps`, each `run:` step with the wrapper as its shell
    (`runtime/exec.cjs` as runner, `runtime/run.cjs` as root). The wrapper
    runs the script with `run0` as `runner-sandbox`, in a logind session of
    its own, with a fixed environment, then stops every process the step
    left behind (before the next step too) and hands back only
-   `name=value` outputs and the step summary. `uses:` steps must be in
-   `sandbox.allowed_actions`, and run as runner. An `upload` step
-   (`{ upload = { name = "log", path = "test.log" } }`) is how the sandbox
-   publishes an artifact: the wrapper's root side copies the path out of
-   the workspace, refusing symlinks, and upload-artifact reads only that
-   copy. Pointing an allowlisted action at a path the sandbox can write
-   would let it read, as runner, whatever the sandbox links there.
+   `name=value` outputs and the step summary. A `stage` step
+   (`{ stage = { name = "log", path = "test.log" } }`) is how the sandbox
+   hands out a file or directory: the wrapper's root side copies it out of
+   the workspace, refusing symlinks, to `gha.staged "log"`. An `upload`
+   step stages the path and uploads that copy as an artifact. `steps` has
+   no actions yet; pure ones will run in the sandbox through a shim
+   ([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)).
+5. a generated step that seals the sandbox: it stops the sandbox's
+   processes for good and makes its workspace, home and leftovers
+   unreadable to runner.
+6. its `publish_steps`, as runner (still without sudo) and with the job's
+   tokens, for credentialed actions: upload-artifact for the `upload`
+   steps, then the job's own. They can read only what was staged, and the
+   compiler refuses expressions in their `run`, `with` or `env` that use a
+   sandboxed step's outputs, which are strings the sandbox chose.
 
 The contracts in `lib/gha.ncl` are closed records, so whatever the compiler
 can't keep sandboxed is a compile error: a step `shell:` or
@@ -111,8 +128,9 @@ later: ubuntu-26.04 and RHEL 10, not ubuntu-24.04
 This is a proof of concept. What works now, checked by `ci` on every pull
 request:
 
-- compiling `runner_steps`, `share` and `steps` to lock files, with the
-  stale-lock check and the reject tests;
+- compiling `runner_steps`, `share`, `steps`, `stage`/`upload` and
+  `publish_steps` to lock files, with the stale-lock check and the reject
+  tests, and unit tests of the workspace hand-off (`tests/runtime/`);
 - `workflows/sandbox-test.ncl` on hosted ubuntu-26.04: steps run as
   `runner-sandbox` in a logind session, `sudo` is refused, the job's tokens,
   `Runner.Worker`'s environment and `/home/runner` are out of reach, shares
@@ -121,6 +139,9 @@ request:
   checkout, uploads through symlinks to `/proc/self/environ` and the
   runner's files, a step that times out with processes left behind, cron,
   at and lingering) fail, and `ci` checks that no artifact holds the token;
+  the sandbox gets only the tracked and included files; and after the
+  seal, publish steps read the staged report as runner but not the
+  sandbox's workspace, home or leftovers in `/dev/shm`;
 - `workflows/agent-review.ncl` on hosted ubuntu-26.04, with a stub agent
   (`runtime/agent-stub.sh`) that reads its prompt from the share and fails
   if it can rewrite it, use sudo or see the job's credentials.
@@ -131,11 +152,9 @@ the task compiler that will produce this compiler's input):
 
 - [#7](https://github.com/cgwalters-forge/workflow-compiler/issues/7) run a real agent through the devspace harness (P1)
 - [#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4) agent-run as a compiler macro or a composite action (P1)
-- [#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16) reuse external actions: a typed workspace hand-off, a shim running pure actions in the sandbox, and `publish_steps` for credentialed ones (P1)
+- [#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16) reuse external actions: the shim running pure actions in the sandbox (the hand-off and `publish_steps` are done) (P1)
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
 - [#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13) the stale-lock check doesn't prove every workflow is compiled (P1)
-- [#15](https://github.com/cgwalters-forge/workflow-compiler/issues/15) credentials left in the workspace reach the sandbox (P1)
-- [#1](https://github.com/cgwalters-forge/workflow-compiler/issues/1) sandboxed step outputs reaching `with:` of allowlisted actions (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
 - [#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17) workflow commands on a sandboxed step's standard output (P1)
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
