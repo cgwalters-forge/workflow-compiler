@@ -7,6 +7,18 @@
 // fields are validated, and the files the sandbox wrote are read without
 // following symlinks.
 //
+// A request {id, action: {uses, entry, stateKey}, env} runs a pinned
+// JavaScript action the enter step fetched (runtime/fetch-actions.cjs):
+// its entry point (`main` or `post`) runs as the sandbox user, with its
+// inputs from env. A request {id, script, env, actionPath} is a `run:`
+// step of a composite action, with GITHUB_ACTION_PATH set.
+//
+// Every step gets its own GITHUB_OUTPUT, GITHUB_ENV, GITHUB_PATH,
+// GITHUB_STATE and GITHUB_STEP_SUMMARY files, owned by the sandbox.
+// Outputs and the summary go back to the runner side; environment and
+// PATH changes apply to later sandboxed steps only, never to the runner,
+// and are kept in ENV_STORE; state goes to the action's post step.
+//
 // A request {id, stage: {name, path}} instead copies PATH from the
 // sandbox's workspace to STAGED_DIR/NAME, for a generated stage step:
 // publish steps run as runner, and actions like upload-artifact follow
@@ -25,6 +37,15 @@ const STEPS_DIR = "/run/runner-sandbox/steps";
 const RESULTS_DIR = "/run/runner-sandbox/results";
 const STAGED_DIR = "/run/runner-sandbox/staged";
 const SEALED = "/run/runner-sandbox/sealed";
+const ENV_STORE = "/run/runner-sandbox/env.json";
+const STATE_DIR = "/run/runner-sandbox/state";
+// Where the enter step fetched the actions, root-owned.
+const ACTIONS_DIR = "/opt/runner-sandbox/actions";
+const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
+const { parse: parseFileCommand } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
+// owner/repo[/path]@<40 hex>, as the compiler pins them.
+const USES_RE = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)((?:\/[A-Za-z0-9_.-]+)*)@([0-9a-f]{40})$/;
+const RUNNER_ARCH = { x64: "X64", arm64: "ARM64" }[process.arch] ?? process.arch.toUpperCase();
 // Filesystems not to look for world-writable directories on, where the
 // sandbox can leave files that outlive its steps (its /tmp and /var/tmp
 // are private to each step): kernel interfaces, not storage.
@@ -110,12 +131,59 @@ try {
   fail(`invalid request: ${e.message}`);
 }
 if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-if (typeof req.script !== "string" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
+if (typeof req.script !== "string" && typeof req.action !== "object" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
 const env = req.env ?? {};
+// The environment reaches the step through a file (see LAUNCHER), so
+// values may span lines, and names may have dashes (INPUT_NODE-VERSION).
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 for (const [k, v] of Object.entries(env)) {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
+  if (!ENV_NAME_RE.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
   if (DENIED_ENV.test(k)) fail(`${k} cannot be passed into the sandbox`);
-  if (typeof v !== "string" || /[\0\n\r]/.test(v)) fail(`${k}: values must be single-line strings`);
+  if (typeof v !== "string" || v.includes("\0")) fail(`${k}: values must be strings without NUL`);
+}
+
+// The directory of a fetched action, from a `uses` the request names.
+function actionDir(uses) {
+  const m = USES_RE.exec(uses ?? "");
+  if (!m) throw new Error(`invalid action ${JSON.stringify(uses)}`);
+  const [, owner, repo, sub, sha] = m;
+  if (sub.split("/").some((c) => c === "." || c === "..")) throw new Error(`invalid action path in ${uses}`);
+  const dir = path.join(ACTIONS_DIR, owner, repo, sha, sub);
+  if (!fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${uses} was not fetched by the enter step`);
+  return { dir, repository: `${owner}/${repo}`, ref: sha };
+}
+
+// A file of an action by its path in action.yml, which must stay inside it.
+function actionFile(dir, rel) {
+  if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
+    throw new Error(`invalid entry point ${JSON.stringify(rel)}`);
+  }
+  const file = fs.realpathSync(path.join(dir, rel));
+  if (!file.startsWith(`${fs.realpathSync(dir)}/`)) throw new Error(`entry point ${rel} leaves the action`);
+  return file;
+}
+
+const STATE_KEY_RE = /^[A-Za-z0-9_-]{1,100}$/;
+
+function readEnvStore() {
+  return fs.existsSync(ENV_STORE) ? JSON.parse(fs.readFileSync(ENV_STORE, "utf8")) : { env: {}, path: [] };
+}
+
+// Applies what a step wrote to GITHUB_ENV and GITHUB_PATH to the store
+// that later sandboxed steps start from. The values are the sandbox's own
+// business, but the names the wrapper sets itself are refused.
+function updateEnvStore(envText, pathText) {
+  const store = readEnvStore();
+  for (const [k, v] of parseFileCommand(envText, "GITHUB_ENV")) {
+    if (DENIED_ENV.test(k)) throw new Error(`GITHUB_ENV: ${k} cannot be set in the sandbox`);
+    store.env[k] = v;
+  }
+  for (const line of pathText.split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean)) {
+    if (!path.isAbsolute(line) || line.includes(":")) throw new Error(`GITHUB_PATH: refusing ${JSON.stringify(line.slice(0, 80))}: must be an absolute path without ':'`);
+    store.path = [line, ...store.path.filter((p) => p !== line)];
+  }
+  fs.writeFileSync(`${ENV_STORE}.tmp`, JSON.stringify(store), { mode: 0o600 });
+  fs.renameSync(`${ENV_STORE}.tmp`, ENV_STORE);
 }
 
 // pam_systemd moves each step into a session scope, which outlives the
@@ -169,6 +237,9 @@ function worldWritableDirs() {
 // whatever it left behind, so publish steps can only read staged outputs.
 function seal() {
   fs.writeFileSync(SEALED, "", { mode: 0o644 });
+  // What the sandbox set for its own later steps, and its actions' state.
+  fs.rmSync(ENV_STORE, { force: true });
+  fs.rmSync(STATE_DIR, { recursive: true, force: true });
   // /var/lib/runner-sandbox (root's) holds the workspace; the home is the
   // sandbox user's.
   for (const dir of [path.dirname(CONFIG.workdir), CONFIG.home]) fs.chmodSync(dir, 0o700);
@@ -213,16 +284,63 @@ if (req.stage || req.seal) {
 const stepDir = path.join(STEPS_DIR, req.id);
 const outDir = path.join(stepDir, "out");
 fs.mkdirSync(stepDir, { mode: 0o755 }); // fails if the id was used before
-fs.writeFileSync(path.join(stepDir, "script.sh"), req.script, { mode: 0o644 });
 fs.mkdirSync(outDir, { mode: 0o700 });
 fs.chownSync(outDir, CONFIG.uid, CONFIG.gid);
+const FILES = { output: "GITHUB_OUTPUT", env: "GITHUB_ENV", path: "GITHUB_PATH", state: "GITHUB_STATE", summary: "GITHUB_STEP_SUMMARY" };
+// @actions/core refuses to write to a file command that doesn't exist, as
+// the runner always creates them.
+for (const f of Object.keys(FILES)) {
+  const file = path.join(outDir, f);
+  fs.writeFileSync(file, "", { mode: 0o600, flag: "wx" });
+  fs.chownSync(file, CONFIG.uid, CONFIG.gid);
+}
 
+let action = null;
+let stateKey = null;
+try {
+  if (req.action) {
+    action = actionDir(req.action.uses);
+    action.entry = actionFile(action.dir, req.action.entry);
+    stateKey = req.action.stateKey ?? null;
+    if (stateKey !== null && !STATE_KEY_RE.test(stateKey)) throw new Error(`invalid state key ${JSON.stringify(stateKey)}`);
+  } else if (req.actionPath !== undefined) {
+    action = actionDir(req.actionPath);
+  }
+} catch (e) {
+  fs.rmSync(stepDir, { recursive: true, force: true });
+  writeResult({ status: 125, error: e.message });
+  process.exit(125);
+}
+
+const store = readEnvStore();
+const state = stateKey && fs.existsSync(path.join(STATE_DIR, `${stateKey}.json`))
+  ? JSON.parse(fs.readFileSync(path.join(STATE_DIR, `${stateKey}.json`), "utf8"))
+  : {};
 const vars = {
+  ...store.env,
+  ...Object.fromEntries(Object.entries(state).map(([k, v]) => [`STATE_${k}`, v])),
   ...env,
-  LANG: "C.UTF-8", PATH: SANDBOX_PATH,
-  GITHUB_OUTPUT: path.join(outDir, "output"),
-  GITHUB_STEP_SUMMARY: path.join(outDir, "summary"),
+  LANG: "C.UTF-8",
+  PATH: [...store.path, SANDBOX_PATH].join(":"),
+  GITHUB_WORKSPACE: CONFIG.workdir,
+  RUNNER_TEMP: CONFIG.tempdir,
+  RUNNER_TOOL_CACHE: CONFIG.toolcache,
+  RUNNER_OS: "Linux",
+  RUNNER_ARCH,
+  ...(action ? { GITHUB_ACTION_PATH: action.dir, GITHUB_ACTION_REPOSITORY: action.repository, GITHUB_ACTION_REF: action.ref } : {}),
+  ...Object.fromEntries(Object.entries(FILES).map(([f, name]) => [name, path.join(outDir, f)])),
 };
+const envFile = path.join(stepDir, "env.json");
+// Readable by the sandbox, which starts with it, and not by runner.
+fs.writeFileSync(envFile, JSON.stringify(vars), { mode: 0o640 });
+fs.chownSync(envFile, 0, CONFIG.gid);
+let command;
+if (req.action) {
+  command = [LAUNCHER, envFile, "node", action.entry];
+} else {
+  fs.writeFileSync(path.join(stepDir, "script.sh"), req.script, { mode: 0o644 });
+  command = [LAUNCHER, envFile, "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", path.join(stepDir, "script.sh")];
+}
 // run0 starts the script as a transient service through its own PAM stack
 // (no pam_env), so pam_systemd gives it a logind session like an SSH login
 // gets: XDG_RUNTIME_DIR and the user's systemd manager, which rootless
@@ -237,9 +355,9 @@ const argv = [
   // The sandbox gets its own /tmp, so it can't leave files there for the
   // runner's later steps; the runner's home is hidden outright.
   "--property=PrivateTmp=yes", `--property=InaccessiblePaths=-${CONFIG.runnerHome}`,
-  ...Object.entries(vars).map(([k, v]) => `--setenv=${k}=${v}`),
+  `--setenv=LANG=${vars.LANG}`, `--setenv=PATH=${vars.PATH}`,
   "--", "env", ...SUDO_VARS.flatMap((v) => ["-u", v]), "--",
-  "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", path.join(stepDir, "script.sh"),
+  ...command,
 ];
 // run0 hands stdio to PID 1 over D-Bus, which accepts pipes but not every
 // file type, so give it an empty pipe rather than /dev/null.
@@ -252,10 +370,17 @@ const stopAfter = stopSandboxProcesses();
 let result;
 try {
   if (stopAfter) throw new Error(stopAfter);
-  result = { status, output: readSandboxFile(path.join(outDir, "output")), summary: readSandboxFile(path.join(outDir, "summary")) };
+  const read = Object.fromEntries(Object.keys(FILES).map((f) => [f, readSandboxFile(path.join(outDir, f))]));
+  updateEnvStore(read.env, read.path);
+  if (stateKey !== null) {
+    const saved = Object.fromEntries(parseFileCommand(read.state, "GITHUB_STATE"));
+    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(STATE_DIR, `${stateKey}.json`), JSON.stringify({ ...state, ...saved }), { mode: 0o600 });
+  }
+  result = { status, output: read.output, summary: read.summary };
 } catch (e) {
   result = { status: 125, error: e.message };
 }
 fs.rmSync(stepDir, { recursive: true, force: true });
 writeResult(result);
-process.exit(status);
+process.exit(result.status);

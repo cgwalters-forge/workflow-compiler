@@ -1,8 +1,10 @@
 // The compiler-generated "enter the sandbox" step, run as root (`sudo node`)
 // right after the job's runner_steps. The compiler prepends
 // `const CONFIG = {...};` to this file and passes the two halves of the step
-// wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, and the
-// workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS.
+// wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, the
+// workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS, and the
+// file command parser and step launcher they use as
+// RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS.
 //
 // It creates the sandbox user, hands it the workspace, installs
 // the two halves of the step wrapper, and (with CONFIG.lockRunnerSudo) takes
@@ -17,6 +19,11 @@ const EXEC = "/usr/local/bin/runner-sandbox-exec";
 const RUN = "/usr/local/libexec/runner-sandbox-run";
 const SUDOERS = "/etc/sudoers.d/zz-runner-sandbox";
 const WORKDIR = "/var/lib/runner-sandbox/work";
+// The sandbox's RUNNER_TEMP and RUNNER_TOOL_CACHE, for the actions it runs.
+const TEMPDIR = "/var/lib/runner-sandbox/temp";
+const TOOLCACHE = "/var/lib/runner-sandbox/toolcache";
+const FILECMD = "/usr/local/libexec/runner-sandbox-filecmd.cjs";
+const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
 const DOCKER_UNITS = ["docker.socket", "docker.service", "containerd.service"];
 
 function run(cmd, args, { check = true } = {}) {
@@ -75,8 +82,12 @@ const copied = handoff({
 });
 console.log(`Handed ${copied} workspace entries (${CONFIG.handoff.workspace}) to ${user} in ${WORKDIR}`);
 fs.chmodSync(runnerHome, 0o700);
+for (const d of [TEMPDIR, TOOLCACHE]) {
+  fs.mkdirSync(d, { mode: 0o755 });
+  fs.chownSync(d, sandbox.uid, sandbox.gid);
+}
 
-fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, runnerHome }), { mode: 0o644 });
+fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome }), { mode: 0o644 });
 // runner-sandbox-run runs as root under this node, through the one sudo
 // rule runner keeps, so the binary and every directory above it must be
 // root's alone: a runner-owned node, as in a tool cache, would give runner
@@ -90,10 +101,15 @@ for (let p = node; ; p = path.dirname(p)) {
   if (p === "/") break;
 }
 fs.mkdirSync("/usr/local/libexec", { recursive: true });
-for (const [dest, text] of [[EXEC, process.env.RUNNER_SANDBOX_EXEC_JS], [RUN, process.env.RUNNER_SANDBOX_RUN_JS]]) {
+for (const [dest, text, shebang] of [
+  [EXEC, process.env.RUNNER_SANDBOX_EXEC_JS, true],
+  [RUN, process.env.RUNNER_SANDBOX_RUN_JS, true],
+  [LAUNCHER, process.env.RUNNER_SANDBOX_LAUNCH_JS, true],
+  [FILECMD, process.env.RUNNER_SANDBOX_FILECMD_JS, false],
+]) {
   if (!text) throw new Error(`nothing to install at ${dest}`);
-  fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
-  fs.chmodSync(dest, 0o755);
+  fs.writeFileSync(dest, shebang ? `#!${node}\n${text}` : text, { mode: 0o755 });
+  fs.chmodSync(dest, shebang ? 0o755 : 0o644);
 }
 for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/staged"]) {
   fs.mkdirSync(d, { recursive: true, mode: 0o755 });

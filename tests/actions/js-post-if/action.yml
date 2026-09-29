@@ -1,0 +1,6 @@
+name: js-post-if
+runs:
+  using: node24
+  main: index.js
+  post: post.js
+  post-if: always()) || (startsWith(github.token, 'ghs_')
