@@ -1,0 +1,35 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "description": "The rules are in the README, under \"Updating pinned versions\".",
+  "ignorePaths": [".github/workflows/*.lock.yml"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Action pins in nickel sources, at a release: \"owner/repo[/path]@<sha>\" ... # v1.2.3",
+      "managerFilePatterns": ["/\\.ncl$/"],
+      "matchStrings": [
+        "\"(?<depName>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(/[A-Za-z0-9_./-]+)?@(?<currentDigest>[0-9a-f]{40})\"[^\\n#]*#\\s*(?<currentValue>v?\\d[^\\s,]*)"
+      ],
+      "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
+      "description": "Action pins in nickel sources that follow a branch: \"owner/repo[/path]@<sha>\" ... # main",
+      "managerFilePatterns": ["/\\.ncl$/"],
+      "matchStrings": [
+        "\"(?<depName>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(/[A-Za-z0-9_./-]+)?@(?<currentDigest>[0-9a-f]{40})\"[^\\n#]*#\\s*(?<currentValue>main|master)\\b"
+      ],
+      "datasourceTemplate": "git-refs",
+      "packageNameTemplate": "https://github.com/{{{depName}}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Runner images in nickel sources, DEFAULT_RUNNER in lib/gha.ncl included",
+      "managerFilePatterns": ["/\\.ncl$/"],
+      "matchStrings": ["\"(?<depName>ubuntu)-(?<currentValue>\\d+\\.\\d+)\""],
+      "datasourceTemplate": "github-runners",
+      "versioningTemplate": "docker"
+    }
+  ]
+}
