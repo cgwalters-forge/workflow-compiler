@@ -475,19 +475,35 @@ when the mistake is subtle.
 
 ### R12. Untrusted text never becomes privileged code
 
-Event data written by pull request, issue and comment authors
-(`github.event.*`, `github.head_ref`) reaches privileged steps only as
-data: in `env:`, never expanded into a `run:` of `runner_steps` or
-`publish_steps`, where Actions splices it into the script's source before
-it runs. This is the classic Actions script injection, and it doesn't need
-the sandbox at all to give an attacker the runner. Like R11 it is a lint on
-the expression text; the task layer must also keep such text out of
-privileged steps entirely, putting it only in shares or sandbox inputs.
+Text others control reaches privileged steps only as data, in `env:`: the
+event data written by pull request, issue and comment authors
+(`github.event.*` other than the numbers and ids GitHub assigns, such as
+`github.event.pull_request.number`; `github.head_ref`), the
+`inputs` of whoever calls or dispatches the workflow, and `needs.*.outputs`
+of other jobs, which may come from their sandboxes. It is never expanded
+into the scripts of `runner_steps` or `publish_steps`: their `run:`,
+github-script's `script:`, or any `with:` of a publish step. Nor is an
+`env:` value holding it expanded there again as `${{ env.X }}`. Actions
+splices `${{ }}` into a script's source before it runs, so this is the
+classic Actions script injection, and it doesn't need the sandbox at all to
+give an attacker the runner. Like R11 it is a lint on the expression text;
+the task layer must also keep such text out of privileged steps entirely,
+putting it only in shares or sandbox inputs.
 
-**Status:** planned
-([#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25)).
+**Status:** holds, as a lint. It doesn't see text a privileged step reads
+from a file or the API itself, and so not its re-expansion either: a value
+a runner step wrote to `GITHUB_ENV` and a script expands as `${{ env.X }}`,
+or an output of a step that read a pull request's title, expanded as
+`${{ steps.x.outputs.y }}`. Nor does it check `with:` of actions in
+`runner_steps` other than github-script, which take data (checkout's
+`ref:`) but could evaluate it.
 
-**Proof:** none yet; it needs reject tests for the spellings.
+**Proof:** `tests/reject/runner-run-event-text.ncl`,
+`publish-run-head-ref.ncl`, `runner-run-github-index.ncl`,
+`runner-run-payload-id.ncl`,
+`runner-run-github-filter.ncl`, `runner-run-env-reexpansion.ncl`,
+`runner-run-inputs.ncl`, `publish-run-needs-outputs.ncl` and
+`publish-github-script-event.ncl`.
 
 ### R13. Nothing the sandbox produced is run as runner later
 
@@ -585,11 +601,11 @@ the roadmap in the [README](../README.md#status-and-roadmap):
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20): caches from the sandbox or untrusted runs restored as runner (R13);
 - [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21): nothing checks the repository settings (R10);
 - [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22): unrestricted network egress ([Non-goals](#non-goals));
-- [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25): expressions from events in privileged `run:` steps (R12);
+- [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25): expressions from events in privileged `run:` steps (R12) (fixed);
 - [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26): the stale-lock check runs the pull request's own compiler (review boundary, R10);
 - [#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27): local sockets and localhost services (R2, R3);
 - [#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28): the ephemeral-runner assumption (R5, R10);
 - [#29](https://github.com/cgwalters-forge/workflow-compiler/issues/29): explicit token permissions (R10);
 - [#30](https://github.com/cgwalters-forge/workflow-compiler/issues/30): what pinned actions pull in (R9);
 - [#31](https://github.com/cgwalters-forge/workflow-compiler/issues/31): Docker container actions in the sandbox (R9);
-- [#32](https://github.com/cgwalters-forge/workflow-compiler/issues/32): the runner's loss of root depends on an opt-out and an untested setting (R4).
+- [#32](https://github.com/cgwalters-forge/workflow-compiler/issues/32): the runner's loss of root depends on an opt-out and an untested setting (R4) (fixed).
