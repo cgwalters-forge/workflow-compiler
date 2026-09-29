@@ -1591,7 +1591,7 @@ jobs:
         console.log(`Entered the sandbox: later run steps execute as ${user} (uid ${sandbox.uid}) in ${WORKDIR}`);
         console.log(run("sudo", ["-l", "-U", runner]).stdout);
       shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}
-    - name: Runs as the sandbox user
+    - name: Runs as the sandbox user (hand-edited)
       run: |-
         id
         test "$(id -un)" = runner-sandbox
