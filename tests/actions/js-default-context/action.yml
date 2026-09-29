@@ -1,0 +1,7 @@
+name: js-default-context
+inputs:
+  t:
+    default: ${{ toJSON(steps) }}
+runs:
+  using: node24
+  main: index.js

@@ -59,14 +59,13 @@ The compiler turns each job into:
    (`runtime/exec.cjs` as runner, `runtime/run.cjs` as root). The wrapper
    runs the script with `run0` as `runner-sandbox`, in a logind session of
    its own, with a fixed environment, then stops every process the step
-   left behind (before the next step too) and hands back only
-   `name=value` outputs and the step summary. A `stage` step
+   left behind (before the next step too) and hands back only its
+   outputs and step summary. A `stage` step
    (`{ stage = { name = "log", path = "test.log" } }`) is how the sandbox
    hands out a file or directory: the wrapper's root side copies it out of
    the workspace, refusing symlinks, to `gha.staged "log"`. An `upload`
-   step stages the path and uploads that copy as an artifact. `steps` has
-   no actions yet; pure ones will run in the sandbox through a shim
-   ([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)).
+   step stages the path and uploads that copy as an artifact. A `uses:`
+   step runs the action in the sandbox, through the shim described below.
 5. a generated step that seals the sandbox: it stops the sandbox's
    processes for good and makes its workspace, home and leftovers
    unreadable to runner.
@@ -90,6 +89,49 @@ a lint against mistakes, not a boundary: a value a runner step put in
 `GITHUB_ENV` still reaches a sandboxed step through `env.X`, for one. The
 boundary is the uid: the sandbox can't read the runner's processes, files
 or tokens, whatever the workflow text says.
+
+## Actions in the sandbox
+
+A `uses:` step in `steps` runs the action as the sandbox user, not as
+runner. A generated step before the sandbox is entered fetches each such
+action at its pinned commit into a root-owned directory under
+`/opt/runner-sandbox/actions` (`runtime/fetch-actions.cjs`), checking its
+`action.yml` against `actions.lock.json`. The sandboxed step then runs the
+action's entry point with the host's node (`runtime/launch.cjs`),
+with its inputs as `INPUT_*` and its own `GITHUB_OUTPUT`, `GITHUB_ENV`,
+`GITHUB_PATH`, `GITHUB_STATE` and step summary files, which the wrapper
+reads back like a `run:` step's. Outputs go to the runner, re-encoded;
+environment and `PATH` changes apply to later sandboxed steps only; state
+goes to the action's post step, which runs after the last sandboxed step.
+`GITHUB_WORKSPACE`, `RUNNER_TEMP` and `RUNNER_TOOL_CACHE` are the
+sandbox's own directories, so setup actions install into a tool cache the
+sandbox owns.
+
+`compile.mjs` locks the metadata of every such action: nickel can't fetch
+anything, so it adds an action to `actions.lock.json` when a source needs
+one, and `--check` verifies each entry against the `action.yml` it holds.
+`workflows/actions-test.ncl` runs DavidAnson/markdownlint-cli2-action
+and actions/setup-node (Node 22 into the sandbox's tool cache) on hosted
+ubuntu-26.04.
+
+Some actions can't run this way, and the compiler says so:
+
+- actions that need the job's credentials: upload-artifact,
+  download-artifact and the cache actions, which the compiler knows by
+  name, and any action whose inputs default to `github.token` and that
+  fails without one (the default is dropped, so it sees an empty token);
+  these go in `publish_steps`, reading staged outputs;
+- Docker container actions: the sandbox has no container engine running as
+  root ([#31](https://github.com/cgwalters-forge/workflow-compiler/issues/31));
+- actions with a `pre` entry point;
+- composite actions, for now;
+- actions that assume they run as runner: writing outside the workspace,
+  `RUNNER_TEMP` and `RUNNER_TOOL_CACHE`, using sudo, or reading the event
+  payload (`GITHUB_EVENT_PATH` isn't set in the sandbox). Those belong in
+  `runner_steps` as setup actions, if they need no sandbox.
+
+Actions run with the host's root-owned node rather than the runner's
+bundled node20 or node24.
 
 `lib/agent-run.ncl` builds a whole agent job from a prompt;
 `workflows/agent-review.ncl` is the complete source of one:
@@ -134,6 +176,10 @@ request:
   the sandbox gets only the tracked and included files; and after the
   seal, publish steps read the staged report as runner but not the
   sandbox's workspace, home or leftovers in `/dev/shm`;
+- `workflows/actions-test.ncl` on hosted ubuntu-26.04: marketplace actions
+  run in the sandbox through the shim (a linter and setup-node), and
+  `GITHUB_ENV`, `GITHUB_PATH` and multi-line outputs work there without
+  reaching the runner;
 - `workflows/agent-review.ncl` on hosted ubuntu-26.04, with a stub agent
   (`runtime/agent-stub.sh`) that reads its prompt from the share and fails
   if it can rewrite it, use sudo or see the job's credentials.
@@ -144,7 +190,6 @@ the task compiler that will produce this compiler's input):
 
 - [#7](https://github.com/cgwalters-forge/workflow-compiler/issues/7) run a real agent through the devspace harness (P1)
 - [#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4) agent-run as a compiler macro or a composite action (P1)
-- [#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16) reuse external actions: the shim running pure actions in the sandbox (the hand-off and `publish_steps` are done) (P1)
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
 - [#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13) the stale-lock check doesn't prove every workflow is compiled (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
