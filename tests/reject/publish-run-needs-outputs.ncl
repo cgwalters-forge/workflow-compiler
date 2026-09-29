@@ -4,7 +4,6 @@ gha.compile {
   name = "t",
   on = { push = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     needs = "build",
     steps = [{ run = "id" }],
     publish_steps = [{ run = "echo ${{ needs.build.outputs.version }}" }],

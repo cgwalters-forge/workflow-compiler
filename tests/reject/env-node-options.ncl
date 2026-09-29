@@ -4,7 +4,6 @@ gha.compile {
   name = "t",
   on = { push = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     steps = [{ env = { NODE_OPTIONS = "--require ./evil.js" }, run = "id" }],
   },
 }

@@ -4,7 +4,6 @@ gha.compile {
   name = "t",
   on = { push = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     steps = [{ env = { RUNNER_SANDBOX_ENV = "GITHUB_TOKEN" }, run = "id" }],
   },
 }

@@ -4,7 +4,6 @@ gha.compile {
   name = "t",
   on = { push = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     steps = [{ id = "out", run = "echo value=x >>\"$GITHUB_OUTPUT\"" }],
     publish_steps = [{ uses = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", with = { name = "${{ toJSON(steps) }}" } }],
   },

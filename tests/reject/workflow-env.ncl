@@ -5,7 +5,6 @@ gha.compile {
   on = { push = {} },
   env.BASH_ENV = "/tmp/x.sh",
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     steps = [{ run = "id" }],
   },
 }
