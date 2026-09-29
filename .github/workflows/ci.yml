@@ -49,6 +49,8 @@ jobs:
           chmod +x "$RUNNER_TEMP/nickel"
       - name: Check lock files and rejections
         run: NICKEL="$RUNNER_TEMP/nickel" node compile.mjs --check
+      - name: Unit tests of the runtime scripts
+        run: node --test 'tests/runtime/*.test.cjs'
       # Also catches an expression in an embedded runtime script, which
       # Actions would expand as the step starts.
       - name: Lint the workflows
