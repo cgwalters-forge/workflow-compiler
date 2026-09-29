@@ -4,17 +4,27 @@
 // script, the variables the compiler listed in RUNNER_SANDBOX_ENV and a
 // fixed set of non-secret context variables, and asks runner-sandbox-run
 // (through sudo) to run the script as the sandbox user. Afterwards it copies
-// the step's outputs and summary into the runner's own files, accepting only
-// plain name=value output lines.
+// the step's outputs and summary into the runner's own files, checking the
+// output names.
 //
-// `runner-sandbox-exec --stage NAME PATH` has the root side copy PATH out
-// of the sandbox for a generated stage step instead, and
+// `runner-sandbox-exec --action SPEC` runs a JavaScript action in the
+// sandbox instead: SPEC is the file the runner wrote from the step's
+// `run:`, the JSON {uses, entry, stateKey} the compiler generated, and
+// the action's inputs are in the step's env. `runner-sandbox-exec
+// --action-path USES SCRIPT` runs a `run:` step of the composite action
+// USES. `runner-sandbox-exec --stage NAME PATH` has the root side copy
+// PATH out of the sandbox for a generated stage step, and
 // `runner-sandbox-exec --seal` has it seal the sandbox after the last
 // sandboxed step.
+//
+// Outputs come back as name=value lines or in the heredoc form, and are
+// written to the runner's GITHUB_OUTPUT re-encoded with a delimiter of
+// this side's choosing (filecmd.cjs).
 "use strict";
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const { parse, format } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
 
 const RUN = "/usr/local/libexec/runner-sandbox-run";
 const SUDO = "/usr/bin/sudo";
@@ -23,30 +33,48 @@ const CONTEXT_ENV = [
   "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_EVENT_NAME", "GITHUB_JOB", "GITHUB_REF", "GITHUB_REF_NAME",
   "GITHUB_REPOSITORY", "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SERVER_URL", "GITHUB_SHA", "GITHUB_WORKFLOW",
 ];
-const OUTPUT_LINE = /^[A-Za-z_][A-Za-z0-9_-]*=[^\r]*$/;
+const USAGE = "usage: runner-sandbox-exec SCRIPT | --action SPEC | --action-path USES SCRIPT | --stage NAME PATH | --seal";
 
 function fail(message) {
   console.error(`runner-sandbox-exec: ${message}`);
   process.exit(125);
 }
 
-const mode = process.argv[2];
-const argc = { "--stage": 5, "--seal": 3 }[mode] ?? 3;
-if (!mode || process.argv.length !== argc || (mode.startsWith("--") && !["--stage", "--seal"].includes(mode))) {
-  fail("usage: runner-sandbox-exec SCRIPT | --stage NAME PATH | --seal");
-}
+const args = process.argv.slice(2);
+const ARGC = { "--action": 2, "--action-path": 3, "--stage": 3, "--seal": 1 };
+if (args.length === 0 || args.length !== (ARGC[args[0]] ?? (args[0].startsWith("--") ? -1 : 1))) fail(USAGE);
 const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
 const env = {};
 for (const name of [...CONTEXT_ENV, ...names]) {
   if (process.env[name] !== undefined) env[name] = process.env[name];
 }
 const id = crypto.randomBytes(16).toString("hex");
-const request = JSON.stringify(
-  mode === "--stage" ? { id, stage: { name: process.argv[3], path: process.argv[4] } }
-  : mode === "--seal" ? { id, seal: true }
-  : { id, script: fs.readFileSync(mode, "utf8"), env });
+let request;
+switch (args[0]) {
+  case "--stage":
+    request = { id, stage: { name: args[1], path: args[2] } };
+    break;
+  case "--seal":
+    request = { id, seal: true };
+    break;
+  case "--action": {
+    let spec;
+    try {
+      spec = JSON.parse(fs.readFileSync(args[1], "utf8"));
+    } catch (e) {
+      fail(`invalid action spec: ${e.message}`);
+    }
+    request = { id, action: { uses: spec.uses, entry: spec.entry, stateKey: spec.stateKey }, env };
+    break;
+  }
+  case "--action-path":
+    request = { id, script: fs.readFileSync(args[2], "utf8"), env, actionPath: args[1] };
+    break;
+  default:
+    request = { id, script: fs.readFileSync(args[0], "utf8"), env };
+}
 // By absolute path: the step's own env: applies to this process.
-const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
+const r = spawnSync(SUDO, ["-n", RUN], { input: JSON.stringify(request), stdio: ["pipe", "inherit", "inherit"] });
 if (r.error) fail(`running ${RUN}: ${r.error.message}`);
 
 let result;
@@ -56,9 +84,12 @@ try {
   fail(`no result from the sandbox (exit ${r.status}): ${e.message}`);
 }
 if (result.error) fail(result.error);
-const lines = result.output.split("\n").filter((l) => l !== "");
-const bad = lines.find((l) => !OUTPUT_LINE.test(l));
-if (bad !== undefined) fail(`refusing GITHUB_OUTPUT line ${JSON.stringify(bad.slice(0, 80))}: only name=value lines are accepted`);
-if (lines.length) fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+let outputs;
+try {
+  outputs = parse(result.output, "GITHUB_OUTPUT");
+} catch (e) {
+  fail(e.message);
+}
+if (outputs.length) fs.appendFileSync(process.env.GITHUB_OUTPUT, outputs.map(([k, v]) => format(k, v)).join(""));
 if (result.summary) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, result.summary);
 process.exit(result.status);

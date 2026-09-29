@@ -1,4 +1,4 @@
-# expect: can't run in `steps` yet: credentialed actions go in `publish_steps`
+# expect: needs the job's credentials, which the sandbox doesn't have
 let gha = import "../../lib/gha.ncl" in
 gha.compile {
   name = "t",

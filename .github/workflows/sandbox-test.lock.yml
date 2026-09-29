@@ -557,17 +557,27 @@ jobs:
           // script, the variables the compiler listed in RUNNER_SANDBOX_ENV and a
           // fixed set of non-secret context variables, and asks runner-sandbox-run
           // (through sudo) to run the script as the sandbox user. Afterwards it copies
-          // the step's outputs and summary into the runner's own files, accepting only
-          // plain name=value output lines.
+          // the step's outputs and summary into the runner's own files, checking the
+          // output names.
           //
-          // `runner-sandbox-exec --stage NAME PATH` has the root side copy PATH out
-          // of the sandbox for a generated stage step instead, and
+          // `runner-sandbox-exec --action SPEC` runs a JavaScript action in the
+          // sandbox instead: SPEC is the file the runner wrote from the step's
+          // `run:`, the JSON {uses, entry, stateKey} the compiler generated, and
+          // the action's inputs are in the step's env. `runner-sandbox-exec
+          // --action-path USES SCRIPT` runs a `run:` step of the composite action
+          // USES. `runner-sandbox-exec --stage NAME PATH` has the root side copy
+          // PATH out of the sandbox for a generated stage step, and
           // `runner-sandbox-exec --seal` has it seal the sandbox after the last
           // sandboxed step.
+          //
+          // Outputs come back as name=value lines or in the heredoc form, and are
+          // written to the runner's GITHUB_OUTPUT re-encoded with a delimiter of
+          // this side's choosing (filecmd.cjs).
           "use strict";
           const fs = require("node:fs");
           const crypto = require("node:crypto");
           const { spawnSync } = require("node:child_process");
+          const { parse, format } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
 
           const RUN = "/usr/local/libexec/runner-sandbox-run";
           const SUDO = "/usr/bin/sudo";
@@ -576,30 +586,48 @@ jobs:
             "CI", "GITHUB_ACTIONS", "GITHUB_ACTOR", "GITHUB_EVENT_NAME", "GITHUB_JOB", "GITHUB_REF", "GITHUB_REF_NAME",
             "GITHUB_REPOSITORY", "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_SERVER_URL", "GITHUB_SHA", "GITHUB_WORKFLOW",
           ];
-          const OUTPUT_LINE = /^[A-Za-z_][A-Za-z0-9_-]*=[^\r]*$/;
+          const USAGE = "usage: runner-sandbox-exec SCRIPT | --action SPEC | --action-path USES SCRIPT | --stage NAME PATH | --seal";
 
           function fail(message) {
             console.error(`runner-sandbox-exec: ${message}`);
             process.exit(125);
           }
 
-          const mode = process.argv[2];
-          const argc = { "--stage": 5, "--seal": 3 }[mode] ?? 3;
-          if (!mode || process.argv.length !== argc || (mode.startsWith("--") && !["--stage", "--seal"].includes(mode))) {
-            fail("usage: runner-sandbox-exec SCRIPT | --stage NAME PATH | --seal");
-          }
+          const args = process.argv.slice(2);
+          const ARGC = { "--action": 2, "--action-path": 3, "--stage": 3, "--seal": 1 };
+          if (args.length === 0 || args.length !== (ARGC[args[0]] ?? (args[0].startsWith("--") ? -1 : 1))) fail(USAGE);
           const names = (process.env.RUNNER_SANDBOX_ENV ?? "").split(",").filter(Boolean);
           const env = {};
           for (const name of [...CONTEXT_ENV, ...names]) {
             if (process.env[name] !== undefined) env[name] = process.env[name];
           }
           const id = crypto.randomBytes(16).toString("hex");
-          const request = JSON.stringify(
-            mode === "--stage" ? { id, stage: { name: process.argv[3], path: process.argv[4] } }
-            : mode === "--seal" ? { id, seal: true }
-            : { id, script: fs.readFileSync(mode, "utf8"), env });
+          let request;
+          switch (args[0]) {
+            case "--stage":
+              request = { id, stage: { name: args[1], path: args[2] } };
+              break;
+            case "--seal":
+              request = { id, seal: true };
+              break;
+            case "--action": {
+              let spec;
+              try {
+                spec = JSON.parse(fs.readFileSync(args[1], "utf8"));
+              } catch (e) {
+                fail(`invalid action spec: ${e.message}`);
+              }
+              request = { id, action: { uses: spec.uses, entry: spec.entry, stateKey: spec.stateKey }, env };
+              break;
+            }
+            case "--action-path":
+              request = { id, script: fs.readFileSync(args[2], "utf8"), env, actionPath: args[1] };
+              break;
+            default:
+              request = { id, script: fs.readFileSync(args[0], "utf8"), env };
+          }
           // By absolute path: the step's own env: applies to this process.
-          const r = spawnSync(SUDO, ["-n", RUN], { input: request, stdio: ["pipe", "inherit", "inherit"] });
+          const r = spawnSync(SUDO, ["-n", RUN], { input: JSON.stringify(request), stdio: ["pipe", "inherit", "inherit"] });
           if (r.error) fail(`running ${RUN}: ${r.error.message}`);
 
           let result;
@@ -609,12 +637,78 @@ jobs:
             fail(`no result from the sandbox (exit ${r.status}): ${e.message}`);
           }
           if (result.error) fail(result.error);
-          const lines = result.output.split("\n").filter((l) => l !== "");
-          const bad = lines.find((l) => !OUTPUT_LINE.test(l));
-          if (bad !== undefined) fail(`refusing GITHUB_OUTPUT line ${JSON.stringify(bad.slice(0, 80))}: only name=value lines are accepted`);
-          if (lines.length) fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+          let outputs;
+          try {
+            outputs = parse(result.output, "GITHUB_OUTPUT");
+          } catch (e) {
+            fail(e.message);
+          }
+          if (outputs.length) fs.appendFileSync(process.env.GITHUB_OUTPUT, outputs.map(([k, v]) => format(k, v)).join(""));
           if (result.summary) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, result.summary);
           process.exit(result.status);
+        RUNNER_SANDBOX_FILECMD_JS: |
+          // Parses and writes the runner's file commands (GITHUB_OUTPUT, GITHUB_ENV,
+          // GITHUB_STATE): `name=value` lines, and the heredoc form
+          //
+          //   name<<DELIMITER
+          //   value, possibly
+          //   several lines
+          //   DELIMITER
+          //
+          // that @actions/core writes for every value. What the sandbox wrote is
+          // untrusted: names are checked, and values are written back to the
+          // runner's own files with a delimiter of the writer's choosing that the
+          // value can't contain, so a value can never end early and start another
+          // name. Installed as /usr/local/libexec/runner-sandbox-filecmd.cjs, where
+          // exec.cjs and run.cjs require it; tests/runtime/ requires it directly.
+          "use strict";
+          const crypto = require("node:crypto");
+
+          const NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+          const HEREDOC_RE = /^([^=<\r\n]+)<<([^\r\n]+)$/;
+
+          // Returns [[name, value], ...] from the text of a file command; throws on
+          // anything else. WHAT names the file in messages.
+          function parse(text, what) {
+            const lines = text.split("\n");
+            if (lines.at(-1) === "") lines.pop();
+            const out = [];
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i].replace(/\r$/, "");
+              if (line === "") continue;
+              const heredoc = HEREDOC_RE.exec(line);
+              let name;
+              let value;
+              if (heredoc) {
+                name = heredoc[1];
+                const delimiter = heredoc[2];
+                const end = lines.findIndex((l, j) => j > i && l.replace(/\r$/, "") === delimiter);
+                if (end < 0) throw new Error(`${what}: no closing ${JSON.stringify(delimiter.slice(0, 40))} for ${JSON.stringify(name.slice(0, 40))}`);
+                value = lines.slice(i + 1, end).map((l) => l.replace(/\r$/, "")).join("\n");
+                i = end;
+              } else {
+                const eq = line.indexOf("=");
+                if (eq < 0) throw new Error(`${what}: refusing line ${JSON.stringify(line.slice(0, 80))}: neither name=value nor name<<DELIMITER`);
+                name = line.slice(0, eq);
+                value = line.slice(eq + 1);
+              }
+              if (!NAME_RE.test(name)) throw new Error(`${what}: invalid name ${JSON.stringify(name.slice(0, 80))}`);
+              if (value.includes("\0")) throw new Error(`${what}: ${name} has a NUL byte`);
+              out.push([name, value]);
+            }
+            return out;
+          }
+
+          // The text that sets NAME to VALUE in a file command, safe for any value.
+          function format(name, value) {
+            if (!NAME_RE.test(name)) throw new Error(`invalid name ${JSON.stringify(name)}`);
+            if (!value.includes("\n") && !value.includes("\r")) return `${name}=${value}\n`;
+            let delimiter;
+            do delimiter = `ghadelimiter_${crypto.randomUUID()}`; while (value.includes(delimiter));
+            return `${name}<<${delimiter}\n${value}\n${delimiter}\n`;
+          }
+
+          module.exports = { parse, format, NAME_RE };
         RUNNER_SANDBOX_HANDOFF_JS: |
           // The workspace hand-off: what the enter step copies from the runner's
           // workspace into the sandbox's. install.cjs loads it (the compiler passes
@@ -812,6 +906,33 @@ jobs:
           }
 
           module.exports = { handoff, handoffPaths, checkCredentials, HANDOFF_MODES };
+        RUNNER_SANDBOX_LAUNCH_JS: |
+          // Starts a sandboxed step's program as the sandbox user, with the
+          // environment runner-sandbox-run wrote to a file: values can span several
+          // lines and input names have dashes (INPUT_NODE-VERSION), which run0's
+          // --setenv can't carry. Installed by the enter step as
+          // /usr/local/libexec/runner-sandbox-launch; for an action, PROGRAM is this
+          // same (root-owned) node and ARGS the action's entry point, which is how
+          // the runner starts it (`node <entry>`).
+          //
+          //   runner-sandbox-launch ENV_JSON PROGRAM [ARGS...]
+          "use strict";
+          const fs = require("node:fs");
+          const os = require("node:os");
+          const { spawnSync } = require("node:child_process");
+
+          const [envFile, program, ...args] = process.argv.slice(2);
+          if (!envFile || !program) {
+            console.error("usage: runner-sandbox-launch ENV_JSON PROGRAM [ARGS...]");
+            process.exit(125);
+          }
+          const env = { ...process.env, ...JSON.parse(fs.readFileSync(envFile, "utf8")) };
+          const r = spawnSync(program === "node" ? process.execPath : program, args, { env, stdio: "inherit" });
+          if (r.error) {
+            console.error(`runner-sandbox-launch: ${r.error.message}`);
+            process.exit(125);
+          }
+          process.exit(r.status ?? 128 + (os.constants.signals[r.signal] ?? 0));
         RUNNER_SANDBOX_RUN_JS: |
           // Root side of a sandboxed step: runner-sandbox-exec pipes a request
           // ({id, script, env}) to this program through `sudo -n`, the one command the
@@ -821,6 +942,18 @@ jobs:
           // GITHUB_OUTPUT and GITHUB_STEP_SUMMARY. Nothing here trusts the request: its
           // fields are validated, and the files the sandbox wrote are read without
           // following symlinks.
+          //
+          // A request {id, action: {uses, entry, stateKey}, env} runs a pinned
+          // JavaScript action the enter step fetched (runtime/fetch-actions.cjs):
+          // its entry point (`main` or `post`) runs as the sandbox user, with its
+          // inputs from env. A request {id, script, env, actionPath} is a `run:`
+          // step of a composite action, with GITHUB_ACTION_PATH set.
+          //
+          // Every step gets its own GITHUB_OUTPUT, GITHUB_ENV, GITHUB_PATH,
+          // GITHUB_STATE and GITHUB_STEP_SUMMARY files, owned by the sandbox.
+          // Outputs and the summary go back to the runner side; environment and
+          // PATH changes apply to later sandboxed steps only, never to the runner,
+          // and are kept in ENV_STORE; state goes to the action's post step.
           //
           // A request {id, stage: {name, path}} instead copies PATH from the
           // sandbox's workspace to STAGED_DIR/NAME, for a generated stage step:
@@ -840,6 +973,15 @@ jobs:
           const RESULTS_DIR = "/run/runner-sandbox/results";
           const STAGED_DIR = "/run/runner-sandbox/staged";
           const SEALED = "/run/runner-sandbox/sealed";
+          const ENV_STORE = "/run/runner-sandbox/env.json";
+          const STATE_DIR = "/run/runner-sandbox/state";
+          // Where the enter step fetched the actions, root-owned.
+          const ACTIONS_DIR = "/opt/runner-sandbox/actions";
+          const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
+          const { parse: parseFileCommand } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
+          // owner/repo[/path]@<40 hex>, as the compiler pins them.
+          const USES_RE = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)((?:\/[A-Za-z0-9_.-]+)*)@([0-9a-f]{40})$/;
+          const RUNNER_ARCH = { x64: "X64", arm64: "ARM64" }[process.arch] ?? process.arch.toUpperCase();
           // Filesystems to look for sticky world-writable directories on, where the
           // sandbox can leave files that outlive its steps (its /tmp and /var/tmp
           // are private to each step): the root filesystem and memory-backed ones
@@ -923,12 +1065,59 @@ jobs:
             fail(`invalid request: ${e.message}`);
           }
           if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
-          if (typeof req.script !== "string" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
+          if (typeof req.script !== "string" && typeof req.action !== "object" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
           const env = req.env ?? {};
+          // The environment reaches the step through a file (see LAUNCHER), so
+          // values may span lines, and names may have dashes (INPUT_NODE-VERSION).
+          const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
           for (const [k, v] of Object.entries(env)) {
-            if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
+            if (!ENV_NAME_RE.test(k)) fail(`invalid variable name ${JSON.stringify(k)}`);
             if (DENIED_ENV.test(k)) fail(`${k} cannot be passed into the sandbox`);
-            if (typeof v !== "string" || /[\0\n\r]/.test(v)) fail(`${k}: values must be single-line strings`);
+            if (typeof v !== "string" || v.includes("\0")) fail(`${k}: values must be strings without NUL`);
+          }
+
+          // The directory of a fetched action, from a `uses` the request names.
+          function actionDir(uses) {
+            const m = USES_RE.exec(uses ?? "");
+            if (!m) throw new Error(`invalid action ${JSON.stringify(uses)}`);
+            const [, owner, repo, sub, sha] = m;
+            if (sub.split("/").some((c) => c === "." || c === "..")) throw new Error(`invalid action path in ${uses}`);
+            const dir = path.join(ACTIONS_DIR, owner, repo, sha, sub);
+            if (!fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${uses} was not fetched by the enter step`);
+            return { dir, repository: `${owner}/${repo}`, ref: sha };
+          }
+
+          // A file of an action by its path in action.yml, which must stay inside it.
+          function actionFile(dir, rel) {
+            if (typeof rel !== "string" || rel === "" || path.isAbsolute(rel) || rel.split("/").some((c) => c === ".." || c === "")) {
+              throw new Error(`invalid entry point ${JSON.stringify(rel)}`);
+            }
+            const file = fs.realpathSync(path.join(dir, rel));
+            if (!file.startsWith(`${fs.realpathSync(dir)}/`)) throw new Error(`entry point ${rel} leaves the action`);
+            return file;
+          }
+
+          const STATE_KEY_RE = /^[A-Za-z0-9_-]{1,100}$/;
+
+          function readEnvStore() {
+            return fs.existsSync(ENV_STORE) ? JSON.parse(fs.readFileSync(ENV_STORE, "utf8")) : { env: {}, path: [] };
+          }
+
+          // Applies what a step wrote to GITHUB_ENV and GITHUB_PATH to the store
+          // that later sandboxed steps start from. The values are the sandbox's own
+          // business, but the names the wrapper sets itself are refused.
+          function updateEnvStore(envText, pathText) {
+            const store = readEnvStore();
+            for (const [k, v] of parseFileCommand(envText, "GITHUB_ENV")) {
+              if (DENIED_ENV.test(k)) throw new Error(`GITHUB_ENV: ${k} cannot be set in the sandbox`);
+              store.env[k] = v;
+            }
+            for (const line of pathText.split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean)) {
+              if (!path.isAbsolute(line) || line.includes(":")) throw new Error(`GITHUB_PATH: refusing ${JSON.stringify(line.slice(0, 80))}: must be an absolute path without ':'`);
+              store.path = [line, ...store.path.filter((p) => p !== line)];
+            }
+            fs.writeFileSync(`${ENV_STORE}.tmp`, JSON.stringify(store), { mode: 0o644 });
+            fs.renameSync(`${ENV_STORE}.tmp`, ENV_STORE);
           }
 
           // pam_systemd moves each step into a session scope, which outlives the
@@ -1019,16 +1208,61 @@ jobs:
           const stepDir = path.join(STEPS_DIR, req.id);
           const outDir = path.join(stepDir, "out");
           fs.mkdirSync(stepDir, { mode: 0o755 }); // fails if the id was used before
-          fs.writeFileSync(path.join(stepDir, "script.sh"), req.script, { mode: 0o644 });
           fs.mkdirSync(outDir, { mode: 0o700 });
           fs.chownSync(outDir, CONFIG.uid, CONFIG.gid);
+          const FILES = { output: "GITHUB_OUTPUT", env: "GITHUB_ENV", path: "GITHUB_PATH", state: "GITHUB_STATE", summary: "GITHUB_STEP_SUMMARY" };
+          // @actions/core refuses to write to a file command that doesn't exist, as
+          // the runner always creates them.
+          for (const f of Object.keys(FILES)) {
+            const file = path.join(outDir, f);
+            fs.writeFileSync(file, "", { mode: 0o600, flag: "wx" });
+            fs.chownSync(file, CONFIG.uid, CONFIG.gid);
+          }
 
+          let action = null;
+          let stateKey = null;
+          try {
+            if (req.action) {
+              action = actionDir(req.action.uses);
+              action.entry = actionFile(action.dir, req.action.entry);
+              stateKey = req.action.stateKey ?? null;
+              if (stateKey !== null && !STATE_KEY_RE.test(stateKey)) throw new Error(`invalid state key ${JSON.stringify(stateKey)}`);
+            } else if (req.actionPath !== undefined) {
+              action = actionDir(req.actionPath);
+            }
+          } catch (e) {
+            fs.rmSync(stepDir, { recursive: true, force: true });
+            writeResult({ status: 125, error: e.message });
+            process.exit(125);
+          }
+
+          const store = readEnvStore();
+          const state = stateKey && fs.existsSync(path.join(STATE_DIR, `${stateKey}.json`))
+            ? JSON.parse(fs.readFileSync(path.join(STATE_DIR, `${stateKey}.json`), "utf8"))
+            : {};
           const vars = {
+            ...store.env,
+            ...Object.fromEntries(Object.entries(state).map(([k, v]) => [`STATE_${k}`, v])),
             ...env,
-            LANG: "C.UTF-8", PATH: SANDBOX_PATH,
-            GITHUB_OUTPUT: path.join(outDir, "output"),
-            GITHUB_STEP_SUMMARY: path.join(outDir, "summary"),
+            LANG: "C.UTF-8",
+            PATH: [...store.path, SANDBOX_PATH].join(":"),
+            GITHUB_WORKSPACE: CONFIG.workdir,
+            RUNNER_TEMP: CONFIG.tempdir,
+            RUNNER_TOOL_CACHE: CONFIG.toolcache,
+            RUNNER_OS: "Linux",
+            RUNNER_ARCH,
+            ...(action ? { GITHUB_ACTION_PATH: action.dir, GITHUB_ACTION_REPOSITORY: action.repository, GITHUB_ACTION_REF: action.ref } : {}),
+            ...Object.fromEntries(Object.entries(FILES).map(([f, name]) => [name, path.join(outDir, f)])),
           };
+          const envFile = path.join(stepDir, "env.json");
+          fs.writeFileSync(envFile, JSON.stringify(vars), { mode: 0o644 });
+          let command;
+          if (req.action) {
+            command = [LAUNCHER, envFile, "node", action.entry];
+          } else {
+            fs.writeFileSync(path.join(stepDir, "script.sh"), req.script, { mode: 0o644 });
+            command = [LAUNCHER, envFile, "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", path.join(stepDir, "script.sh")];
+          }
           // run0 starts the script as a transient service through its own PAM stack
           // (no pam_env), so pam_systemd gives it a logind session like an SSH login
           // gets: XDG_RUNTIME_DIR and the user's systemd manager, which rootless
@@ -1043,9 +1277,9 @@ jobs:
             // The sandbox gets its own /tmp, so it can't leave files there for the
             // runner's later steps; the runner's home is hidden outright.
             "--property=PrivateTmp=yes", `--property=InaccessiblePaths=-${CONFIG.runnerHome}`,
-            ...Object.entries(vars).map(([k, v]) => `--setenv=${k}=${v}`),
+            `--setenv=LANG=${vars.LANG}`, `--setenv=PATH=${vars.PATH}`,
             "--", "env", ...SUDO_VARS.flatMap((v) => ["-u", v]), "--",
-            "/bin/bash", "--noprofile", "--norc", "-e", "-o", "pipefail", path.join(stepDir, "script.sh"),
+            ...command,
           ];
           // run0 hands stdio to PID 1 over D-Bus, which accepts pipes but not every
           // file type, so give it an empty pipe rather than /dev/null.
@@ -1058,13 +1292,20 @@ jobs:
           let result;
           try {
             if (stopAfter) throw new Error(stopAfter);
-            result = { status, output: readSandboxFile(path.join(outDir, "output")), summary: readSandboxFile(path.join(outDir, "summary")) };
+            const read = Object.fromEntries(Object.keys(FILES).map((f) => [f, readSandboxFile(path.join(outDir, f))]));
+            updateEnvStore(read.env, read.path);
+            if (stateKey !== null) {
+              const saved = Object.fromEntries(parseFileCommand(read.state, "GITHUB_STATE"));
+              fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+              fs.writeFileSync(path.join(STATE_DIR, `${stateKey}.json`), JSON.stringify({ ...state, ...saved }), { mode: 0o600 });
+            }
+            result = { status, output: read.output, summary: read.summary };
           } catch (e) {
             result = { status: 125, error: e.message };
           }
           fs.rmSync(stepDir, { recursive: true, force: true });
           writeResult(result);
-          process.exit(status);
+          process.exit(result.status);
       name: Enter the sandbox (generated)
       run: |
         const CONFIG = {
@@ -1081,8 +1322,10 @@ jobs:
         // The compiler-generated "enter the sandbox" step, run as root (`sudo node`)
         // right after the job's runner_steps. The compiler prepends
         // `const CONFIG = {...};` to this file and passes the two halves of the step
-        // wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, and the
-        // workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS.
+        // wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, the
+        // workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS, and the
+        // file command parser and step launcher they use as
+        // RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS.
         //
         // It creates the sandbox user, hands it the workspace, installs
         // the two halves of the step wrapper, and (with CONFIG.lockRunnerSudo) takes
@@ -1097,6 +1340,11 @@ jobs:
         const RUN = "/usr/local/libexec/runner-sandbox-run";
         const SUDOERS = "/etc/sudoers.d/zz-runner-sandbox";
         const WORKDIR = "/var/lib/runner-sandbox/work";
+        // The sandbox's RUNNER_TEMP and RUNNER_TOOL_CACHE, for the actions it runs.
+        const TEMPDIR = "/var/lib/runner-sandbox/temp";
+        const TOOLCACHE = "/var/lib/runner-sandbox/toolcache";
+        const FILECMD = "/usr/local/libexec/runner-sandbox-filecmd.cjs";
+        const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
         const DOCKER_UNITS = ["docker.socket", "docker.service", "containerd.service"];
 
         function run(cmd, args, { check = true } = {}) {
@@ -1155,8 +1403,12 @@ jobs:
         });
         console.log(`Handed ${copied} workspace entries (${CONFIG.handoff.workspace}) to ${user} in ${WORKDIR}`);
         fs.chmodSync(runnerHome, 0o700);
+        for (const d of [TEMPDIR, TOOLCACHE]) {
+          fs.mkdirSync(d, { mode: 0o755 });
+          fs.chownSync(d, sandbox.uid, sandbox.gid);
+        }
 
-        fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, runnerHome }), { mode: 0o644 });
+        fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome }), { mode: 0o644 });
         // runner-sandbox-run runs as root under this node, through the one sudo
         // rule runner keeps, so the binary and every directory above it must be
         // root's alone: a runner-owned node, as in a tool cache, would give runner
@@ -1170,10 +1422,15 @@ jobs:
           if (p === "/") break;
         }
         fs.mkdirSync("/usr/local/libexec", { recursive: true });
-        for (const [dest, text] of [[EXEC, process.env.RUNNER_SANDBOX_EXEC_JS], [RUN, process.env.RUNNER_SANDBOX_RUN_JS]]) {
+        for (const [dest, text, shebang] of [
+          [EXEC, process.env.RUNNER_SANDBOX_EXEC_JS, true],
+          [RUN, process.env.RUNNER_SANDBOX_RUN_JS, true],
+          [LAUNCHER, process.env.RUNNER_SANDBOX_LAUNCH_JS, true],
+          [FILECMD, process.env.RUNNER_SANDBOX_FILECMD_JS, false],
+        ]) {
           if (!text) throw new Error(`nothing to install at ${dest}`);
-          fs.writeFileSync(dest, `#!${node}\n${text}`, { mode: 0o755 });
-          fs.chmodSync(dest, 0o755);
+          fs.writeFileSync(dest, shebang ? `#!${node}\n${text}` : text, { mode: 0o755 });
+          fs.chmodSync(dest, shebang ? 0o755 : 0o644);
         }
         for (const d of ["/run/runner-sandbox/steps", "/run/runner-sandbox/results", "/run/runner-sandbox/staged"]) {
           fs.mkdirSync(d, { recursive: true, mode: 0o755 });
@@ -1218,7 +1475,7 @@ jobs:
         }
         console.log(`Entered the sandbox: later run steps execute as ${user} (uid ${sandbox.uid}) in ${WORKDIR}`);
         console.log(run("sudo", ["-l", "-U", runner]).stdout);
-      shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS node {0}
+      shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}
     - name: Runs as the sandbox user
       run: |-
         id
@@ -1265,8 +1522,12 @@ jobs:
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - name: The job's credentials are out of reach
       run: |-
-        for v in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN GITHUB_ENV GITHUB_PATH; do
+        for v in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN; do
           if [[ -v $v ]]; then echo "$v is set"; exit 1; fi
+        done
+        # The file commands are the sandbox's own.
+        for v in GITHUB_ENV GITHUB_PATH GITHUB_OUTPUT GITHUB_STATE GITHUB_STEP_SUMMARY; do
+          test "$(stat -c %U "$(dirname "${!v}")")" = runner-sandbox
         done
         worker=$(pgrep -f Runner.Worker | head -n1)
         test -n "$worker"
@@ -1318,8 +1579,8 @@ jobs:
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - continue-on-error: true
       id: heredoc
-      name: Smuggle a multi-line output
-      run: printf 'x<<EOF\nsomething\nEOF\n' >>"$GITHUB_OUTPUT"
+      name: Smuggle an output with a bad name
+      run: printf 'x y<<EOF\nsomething\nEOF\n' >>"$GITHUB_OUTPUT"
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - name: Leave a process behind
       run: setsid sleep 600 </dev/null >/dev/null 2>&1 & echo "started $!"

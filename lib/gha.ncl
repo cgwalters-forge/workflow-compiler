@@ -79,12 +79,6 @@ let OneOfRunUses = validator
   (fun step => "a step needs exactly one of `run` or `uses`")
 in
 
-# Until the shim runs pure actions in the sandbox (#16), `steps` has no
-# actions at all: one there would run as runner, with the job's tokens.
-let NoActionInSandbox = validator
-  (fun step => !(std.record.has_field "uses" step))
-  (fun step => "`%{step.uses}` can't run in `steps` yet: credentialed actions go in `publish_steps`, which read staged outputs, and pure actions will run in the sandbox through a shim (#16)")
-in
 
 # Text others control (an issue's, a comment's or a pull request's, in
 # `github.event.*` and `github.head_ref`; a caller's or dispatcher's
@@ -257,7 +251,6 @@ let SandboxStep = std.contract.Sequence [
     "timeout-minutes" | Number | optional,
   },
   OneOfRunUses,
-  NoActionInSandbox,
 ] in
 
 # Expressions in a publish step's `run`, `with` and `env` may not use a
@@ -384,11 +377,13 @@ let install_step = fun sandbox job_handoff =>
     name = "Enter the sandbox (generated)",
     # sudo resets the environment; the runner's NOPASSWD: ALL rule allows
     # keeping these.
-    shell = "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS node {0}",
+    shell = "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}",
     env = {
       RUNNER_SANDBOX_EXEC_JS = import "../runtime/exec.cjs" as 'Text,
       RUNNER_SANDBOX_RUN_JS = import "../runtime/run.cjs" as 'Text,
       RUNNER_SANDBOX_HANDOFF_JS = import "../runtime/handoff.cjs" as 'Text,
+      RUNNER_SANDBOX_FILECMD_JS = import "../runtime/filecmd.cjs" as 'Text,
+      RUNNER_SANDBOX_LAUNCH_JS = import "../runtime/launch.cjs" as 'Text,
     },
     run = "const CONFIG = %{std.serialize 'Json config};\n" ++ (import "../runtime/install.cjs" as 'Text),
   }
@@ -419,6 +414,155 @@ in
 
 let runner_step = fun step =>
   if std.record.has_field "share" step then share_step (step | ShareStep) else step | RunnerStep
+in
+
+# Actions in `steps` run in the sandbox: the shim. A generated step
+# before the sandbox is entered fetches each one at its pinned commit into
+# a root-owned directory (runtime/fetch-actions.cjs), and the step runs its
+# entry point there as the sandbox user (runtime/launch.cjs), with
+# its inputs as INPUT_* and sandbox-owned file-command files, which the
+# wrapper validates on the way out. Their metadata comes from
+# actions.lock.json, which compile.mjs fills: nickel can't fetch anything.
+let ACTIONS_LOCK = import "../actions.lock.json" in
+let ACTIONS_DIR = "/opt/runner-sandbox/actions" in
+# The sandbox's paths, as runtime/install.cjs creates them, for the
+# contexts an action's defaults and composite steps name.
+let SANDBOX_CONTEXTS = [
+  { re = "(?i)\\bgithub\\s*\\.\\s*workspace\\b", path = "/var/lib/runner-sandbox/work" },
+  { re = "(?i)\\brunner\\s*\\.\\s*temp\\b", path = "/var/lib/runner-sandbox/temp" },
+  { re = "(?i)\\brunner\\s*\\.\\s*tool_cache\\b", path = "/var/lib/runner-sandbox/toolcache" },
+] in
+
+let action_meta = fun uses =>
+  if std.record.has_field uses ACTIONS_LOCK then
+    ACTIONS_LOCK."%{uses}"
+  else
+    std.fail_with "action `%{uses}` is not in actions.lock.json; run node compile.mjs to lock its metadata"
+in
+
+# F applied to the inside of every `${{ }}` in S. (Not with split on
+# `}}`: std.string.split drops a trailing empty piece.)
+let map_exprs = fun f s =>
+  let parts = std.string.split "${{" s in
+  if parts == [] then
+    s
+  else
+    std.string.join "${{" (
+      [std.array.first parts]
+      @ std.array.map
+        (fun p =>
+          if std.string.contains "}}" p then
+            let at = (std.string.find "\\}\\}" p).index in
+            f (std.string.substring 0 at p) ++ std.string.substring at (std.string.length p) p
+          else
+            f p)
+        (std.array.drop_first parts)
+    )
+in
+
+# Contexts that name the runner's paths name the sandbox's instead.
+let sandbox_paths = map_exprs (fun e =>
+  std.array.fold_left (fun acc c => std.string.replace_regex c.re "'%{c.path}'" acc) e SANDBOX_CONTEXTS)
+in
+
+let input_env_name = fun name => "INPUT_%{std.string.uppercase (std.string.replace " " "_" name)}" in
+
+# The INPUT_* variables of an action: the step's `with`, else the input's
+# default. A default naming the job's token is dropped (the sandbox has
+# none), as the runner would never hand it one.
+let input_env = fun meta with =>
+  let inputs = if std.record.has_field "inputs" meta && meta.inputs != null then meta.inputs else {} in
+  let default_of = fun name =>
+    let i = inputs."%{name}" in
+    if std.is_record i && std.record.has_field "default" i && std.is_string i.default && !(mentions_credentials i.default) then
+      [sandbox_paths i.default]
+    else if std.is_record i && std.record.has_field "default" i && (std.is_number i.default || std.is_bool i.default) then
+      [std.to_string i.default]
+    else
+      []
+  in
+  let names = std.record.fields inputs @ std.array.filter (fun n => !(std.record.has_field n inputs)) (std.record.fields with) in
+  std.array.fold_left
+    (fun acc name =>
+      let v = if std.record.has_field name with then [with."%{name}"] else default_of name in
+      if v == [] then acc else std.record.insert (input_env_name name) (std.array.first v) acc)
+    {}
+    names
+in
+
+# The directory the fetch step puts USES in.
+let action_dir = fun uses =>
+  let at = std.string.split "@" uses in
+  let parts = std.string.split "/" (std.array.first at) in
+  std.string.join "/" ([ACTIONS_DIR, std.array.at 0 parts, std.array.at 1 parts, std.array.at 1 at] @ std.array.drop_first (std.array.drop_first parts))
+in
+
+# `env` with RUNNER_SANDBOX_ENV listing its names, which exec.cjs forwards.
+let with_env_list = fun env =>
+  let names = std.record.fields env in
+  if names == [] then env else std.record.insert "RUNNER_SANDBOX_ENV" (std.string.join "," names) env
+in
+
+let JS_RUNTIMES = ["node12", "node16", "node20", "node24"] in
+# Actions known to need the job's runtime token, which the sandbox never
+# has: they would fail there, so say where they go instead.
+let CREDENTIALED_ACTIONS = [
+  "actions/upload-artifact", "actions/download-artifact",
+  "actions/cache", "actions/cache/save", "actions/cache/restore",
+] in
+
+# The steps a `uses:` step in `steps` compiles to: {main, post, fetch},
+# `main` in its place, `post` after the last sandboxed step, and `fetch`
+# the actions the fetch step must get. KEY is the step's id, generated if
+# it has none, which links the post step to the main one's state.
+let action_steps = fun key step =>
+  let ref = step.uses in
+  let meta = (action_meta ref).metadata in
+  let runs = meta.runs in
+  let using = if std.record.has_field "using" runs then runs.using else "" in
+  let with = if std.record.has_field "with" step then step.with else {} in
+  let user_env = if std.record.has_field "env" step then step.env else {} in
+  let step_env = with_env_list (std.array.fold_left (fun acc f => std.record.update f user_env."%{f}" acc) (input_env meta with) (std.record.fields user_env)) in
+  let common = std.record.filter (fun n _v => std.array.elem n ["name", "if", "continue-on-error", "timeout-minutes"]) step in
+  let spec = fun entry_point => std.serialize 'Json { uses = ref, entry = entry_point, stateKey = key } in
+  let fetched = [{ uses = ref, file = (action_meta ref).file, sha256 = (action_meta ref).sha256 }] in
+  if std.array.elem (std.array.first (std.string.split "@" ref)) CREDENTIALED_ACTIONS then
+    std.fail_with "`%{ref}` needs the job's credentials, which the sandbox doesn't have: put it in `publish_steps` (reading what a `stage` step staged), or use an `upload` step"
+  else if std.array.elem using JS_RUNTIMES then
+    if std.record.has_field "pre" runs then
+      std.fail_with "`%{ref}` has a `pre` entry point, which the sandbox shim doesn't run; use it in runner_steps if it needs no sandbox"
+    else
+      {
+        main = [
+          common
+          & {
+            name | default = "Run %{ref} (sandboxed)",
+            id = key,
+            shell = "%{EXEC} --action {0}",
+            run = spec runs.main,
+            env = step_env,
+          }
+        ],
+        post =
+          if std.record.has_field "post" runs then
+            let post_if = if std.record.has_field "post-if" runs then runs."post-if" else "always()" in
+            [
+              {
+                name = "Post %{ref} (generated)",
+                "if" = "(%{post_if}) && steps.%{key}.outcome != 'skipped'",
+                shell = "%{EXEC} --action {0}",
+                run = spec runs.post,
+                env = step_env,
+              }
+            ]
+          else
+            [],
+        fetch = fetched,
+      }
+  else if using == "docker" then
+    std.fail_with "`%{ref}` is a Docker action, which can't run in the sandbox (no container engine as root); run the tool in a `run:` step with rootless podman instead"
+  else
+    std.fail_with "`%{ref}` runs with `%{using}`, which the sandbox shim doesn't support"
 in
 
 let sandbox_step = fun step =>
@@ -476,19 +620,55 @@ let seal_step = {
 
 let COMPILER_FIELDS = ["sandbox", "handoff", "runner_steps", "steps", "publish_steps"] in
 
+# The generated step that fetches the sandbox's actions, one clone per
+# repository and commit, or nothing when the job uses none.
+let fetch_steps = fun fetch =>
+  let by_commit =
+    std.array.fold_left
+      (fun acc f =>
+        let at = std.string.split "@" f.uses in
+        let parts = std.string.split "/" (std.array.first at) in
+        let repository = "%{std.array.at 0 parts}/%{std.array.at 1 parts}" in
+        let k = "%{repository}@%{std.array.at 1 at}" in
+        let prev = if std.record.has_field k acc then acc."%{k}".files else {} in
+        std.record.update k { repo = repository, sha = std.array.at 1 at, files = std.record.update f.file f.sha256 prev } acc)
+      {}
+      fetch
+  in
+  if fetch == [] then
+    []
+  else
+    [
+      {
+        name = "Fetch the sandbox's actions (generated)",
+        shell = "sudo --preserve-env=RUNNER_SANDBOX_ACTIONS node {0}",
+        env.RUNNER_SANDBOX_ACTIONS = std.serialize 'Json (std.record.values by_commit),
+        run = import "../runtime/fetch-actions.cjs" as 'Text,
+      }
+    ]
+in
+
 let compile_job = fun job =>
   let sandbox = job.sandbox in
-  let steps =
-    std.array.map
-      (fun s =>
+  let compiled =
+    std.array.generate
+      (fun i =>
+        let s = std.array.at i job.steps in
         if std.record.has_field "stage" s then
-          stage_step "stage" (s | StageStep)
+          { main = [stage_step "stage" (s | StageStep)], post = [], fetch = [] }
         else if std.record.has_field "upload" s then
-          stage_step "upload" (s | UploadStep)
+          { main = [stage_step "upload" (s | UploadStep)], post = [], fetch = [] }
         else
-          sandbox_step (s | SandboxStep))
-      job.steps
+          let s = s | SandboxStep in
+          if std.record.has_field "uses" s then
+            action_steps (if std.record.has_field "id" s then s.id else "action-%{std.to_string i}") s
+          else
+            { main = [sandbox_step s], post = [], fetch = [] })
+      (std.array.length job.steps)
   in
+  let steps = std.array.flat_map (fun c => c.main) compiled in
+  let posts = std.array.reverse (std.array.flat_map (fun c => c.post) compiled) in
+  let fetch = std.array.flat_map (fun c => c.fetch) compiled in
   let uploads = std.array.map upload_publish_step (std.array.filter (fun s => std.record.has_field "upload" s) job.steps) in
   let publish_ids =
     std.array.map (fun s => std.string.lowercase s.id) (std.array.filter (fun s => std.is_record s && std.record.has_field "id" s) job.publish_steps)
@@ -522,8 +702,10 @@ let compile_job = fun job =>
   |> std.record.filter (fun name _v => !(std.array.elem name COMPILER_FIELDS))
   |> std.record.insert "steps" (
     std.array.map runner_step job.runner_steps
+    @ fetch_steps fetch
     @ [secure_host_step, install_step sandbox job.handoff]
     @ steps
+    @ posts
     @ [seal_step]
     @ uploads
     @ publish

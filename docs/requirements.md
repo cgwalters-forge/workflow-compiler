@@ -139,8 +139,7 @@ artifacts.
 
 A compiled job always has the same shape. The source names three of the
 phases; the compiler generates the rest, and nothing in the source can
-reorder them. All six exist; actions in `steps` wait for the shim
-([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)).
+reorder them. All six exist.
 
 ```text
 runner_steps      as runner, with sudo      setup actions, packages, checkout, shares
@@ -329,13 +328,12 @@ step's exit status, which decides its outcome and whether later
 `success()` steps run; and its standard output and error, which go to the
 job's log.
 
-**Status:** partial. #12 accepts only single-line `name=value` outputs and
-refuses `GITHUB_ENV` and `GITHUB_PATH`. The shim
-([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16))
-needs more, because `@actions/core` writes every output in the heredoc
-form: it adds multi-line outputs, re-encoded by the runner side with a
-delimiter of its own, and environment and `PATH` changes that apply to
-later sandboxed steps only. Standard output reaches the runner's parser of
+**Status:** partial. Outputs are `name=value` lines or the heredoc form
+`@actions/core` writes for every value, re-encoded by the runner side with
+a delimiter of its own, so a value can't end early and set another name.
+`GITHUB_ENV` and `GITHUB_PATH` apply to later sandboxed steps only, never
+to the runner, and can't set what the wrapper sets itself (`PATH`, `LD_*`,
+`NODE_*`, `RUNNER_*` and the like). Standard output reaches the runner's parser of
 workflow commands, so a step can still use `::set-output` or `::add-mask::`
 ([#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17)).
 Staged outputs have no size cap
@@ -344,8 +342,12 @@ and files the sandbox leaves in `/dev/shm` or its workspace stay readable
 to runner until the seal, which hides or removes them.
 
 **Proof:** `sandbox-test` steps "Write a step output", "Read it back",
-"Point GITHUB_OUTPUT at a root-only file" and "Smuggle a multi-line output"
-(which must fail in #12); the upload steps that point at
+"Point GITHUB_OUTPUT at a root-only file" and "Smuggle an output with a
+bad name"; `actions-test` steps "Set environment for later sandboxed
+steps", "Read it back", "The sandbox can't set what the wrapper sets", "An
+unterminated heredoc output fails the step" and the publish step "Nothing
+the sandbox set reached the runner"; `tests/runtime/filecmd.test.cjs`; the
+upload steps that point at
 `/proc/self/environ` and the runner's files through symlinks, and
 `sandbox-test-artifacts`.
 
@@ -390,19 +392,24 @@ middle of the sandbox. In `publish_steps` any pinned action may run. A
 composite action is expanded into its steps at compile time, so each of
 them lands in the phase the composite was used in.
 
-**Status:** partial. Pinning holds, and nothing runs as runner in the
-middle of `steps` any more: until the shim
-([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16)),
-`steps` takes no actions at all.
-A pin covers the action's own files, not a composite's nested `uses:`, a
-Docker image or what the action downloads, and GitHub resolves a SHA from
-anywhere in the repository's fork network
+**Status:** partial. Pinning holds, nothing runs as runner in the middle
+of `steps`, and the shim runs JavaScript actions there; the
+[README](../README.md#actions-in-the-sandbox) lists the actions it can't
+run, which are compile errors. The fetch step checks each action's
+`action.yml` against the sha256 in `actions.lock.json`, so the metadata
+the compiler used is that commit's. A pin covers the action's own files,
+not a composite's nested `uses:`, a Docker image or what the action
+downloads, and GitHub resolves a SHA from anywhere in the repository's
+fork network
 ([#30](https://github.com/cgwalters-forge/workflow-compiler/issues/30)).
 Post-steps of setup actions run as runner at the end of the job
 ([#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2)).
 
 **Proof:** `tests/reject/unpinned-action.ncl`,
-`tests/reject/action-in-steps.ncl`.
+`tests/reject/credentialed-action-in-steps.ncl`; `workflows/actions-test.ncl`
+on hosted ubuntu-26.04, which runs DavidAnson/markdownlint-cli2-action
+and actions/setup-node (into the sandbox's tool cache, with its post
+step).
 
 ### R10. What the guarantee depends on
 
