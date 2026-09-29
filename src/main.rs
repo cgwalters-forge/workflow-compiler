@@ -25,9 +25,10 @@ enum Command {
     Compile(Repo),
     /// Fail if a lock file or expected output is stale or hand-edited, if
     /// actions.lock.json doesn't match the action.yml files it holds, if
-    /// a source in tests/reject/ compiles, or if a workflow in
+    /// a source in tests/reject/ compiles, if a workflow in
     /// .github/workflows/ is neither a lock file with the compiled shape
-    /// nor listed in .github/uncompiled-workflows.
+    /// nor listed in .github/uncompiled-workflows, or if a shell script a
+    /// source imports fails `bash -n` or shellcheck.
     Check(Repo),
     /// Write the tree of COMMIT into DEST, which must not exist, as plain
     /// files: every blob exactly as committed, ignoring .gitattributes.

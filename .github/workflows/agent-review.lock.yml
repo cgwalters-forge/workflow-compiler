@@ -298,7 +298,9 @@ jobs:
         HARNESS_SHA: 13308dc5480bc9f89dbf4b9abfabc7972222db8e
         HARNESS_SHARE: /usr/local/share/bot-harness
       name: Build bot-harness at a pinned commit
-      run: |-
+      run: |
+        # agent-run: Build bot-harness at a pinned commit
+        # shellcheck shell=bash
         set -euo pipefail
         src="$RUNNER_TEMP/bot-harness"
         git init -q "$src"

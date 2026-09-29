@@ -8,7 +8,9 @@ jobs:
       with:
         persist-credentials: false
     - name: Install a tool system-wide
-      run: |-
+      run: |
+        # sandbox-test: Install a tool system-wide
+        # shellcheck shell=bash
         sudo tee /usr/local/bin/hello-tool >/dev/null <<'EOF'
         #!/bin/sh
         echo "installed by runner_steps, run by $(id -un)"
@@ -1206,7 +1208,9 @@ jobs:
       run: test "$OUTCOME" = failure
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - name: The job's credentials are out of reach
-      run: |-
+      run: |
+        # sandbox-test: The job's credentials are out of reach
+        # shellcheck shell=bash
         for v in ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN; do
           if [[ -v $v ]]; then echo "$v is set"; exit 1; fi
         done
@@ -1222,12 +1226,15 @@ jobs:
         echo "no credentials reachable"
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - env:
-        RUNNER_SANDBOX_ENV: SYMLINK_DIR_SHARE,SYMLINK_SHARE
+        RUNNER_SANDBOX_ENV: SHARE_DIR,SYMLINK_DIR_SHARE,SYMLINK_SHARE
+        SHARE_DIR: /etc/agent-share
         SYMLINK_DIR_SHARE: ${{ steps.share-symlink-dir.outcome }}
         SYMLINK_SHARE: ${{ steps.share-symlink.outcome }}
       name: Read the shares, and fail to change them
-      run: |-
-        cd /etc/agent-share
+      run: |
+        # sandbox-test: Read the shares, and fail to change them
+        # shellcheck shell=bash
+        cd "$SHARE_DIR" || exit
         ls -lR
         test "$(cat greeting)" = "hello from $GITHUB_JOB"
         cmp LICENSE /var/lib/runner-sandbox/work/LICENSE
@@ -1269,7 +1276,9 @@ jobs:
       shell: /usr/local/bin/runner-sandbox-exec {0}
     - id: commands
       name: Issue workflow commands
-      run: |-
+      run: |
+        # sandbox-test: Issue workflow commands
+        # shellcheck shell=bash
         c=::
         echo "${c}set-output name=smuggled::1"
         echo "  ${c}save-state name=smuggled::1"
@@ -1434,7 +1443,9 @@ jobs:
         LINES: ${{ steps.read-report.outputs.lines }}
       if: (success()) && steps.runner-sandbox-seal.outcome == 'success'
       name: The sandbox is sealed
-      run: |-
+      run: |
+        # sandbox-test: The sandbox is sealed
+        # shellcheck shell=bash
         test "$LINES" = 1
         for p in /var/lib/runner-sandbox/work/report.txt /home/runner-sandbox/private/notes; do
           if cat "$p" 2>/dev/null; then echo "read $p after the seal"; exit 1; fi

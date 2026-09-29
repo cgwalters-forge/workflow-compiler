@@ -17,7 +17,8 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use nickel_lang_core::ast::{Ast, AstAlloc, Import, InputFormat, Node};
+use nickel_lang_core::ast::record::FieldPathElem;
+use nickel_lang_core::ast::{Ast, AstAlloc, Import, InputFormat, Node, StringChunk};
 use nickel_lang_core::cache::{CacheHub, SourcePath};
 use nickel_lang_core::error::report::{ColorOpt, report_as_str};
 use nickel_lang_core::error::{Error, IntoDiagnostics, NullReporter};
@@ -37,6 +38,10 @@ type VmContext = nickel_lang_core::eval::VmContext<CacheHub, CacheImpl>;
 /// that nothing it could resolve by itself is a file of the repository.
 /// Reports show paths relative to the root instead.
 const VIRTUAL_ROOT: &str = "/%wfc%";
+
+/// The most lines a `run` script may have inline in a source; a longer
+/// one goes in a file of its own.
+pub const MAX_INLINE_SCRIPT_LINES: usize = 10;
 
 /// The stack evaluation runs on: nickel's evaluation recurses deeply, and
 /// a spawned thread's default is 2 MiB.
@@ -107,10 +112,66 @@ fn report(cache: &CacheHub, error: impl IntoDiagnostics) -> String {
     ))
 }
 
+/// The number of lines of `node` if it is a string literal, with or
+/// without interpolations; `None` for anything else, an import included.
+fn literal_lines(node: &Ast<'_>) -> Option<usize> {
+    let newlines = match &node.node {
+        Node::String(s) => s.trim_end_matches('\n').matches('\n').count(),
+        Node::StringChunks(chunks) => chunks
+            .iter()
+            .map(|c| match c {
+                StringChunk::Literal(s) => s.matches('\n').count(),
+                StringChunk::Expr(..) => 0,
+            })
+            .sum(),
+        _ => return None,
+    };
+    Some(newlines + 1)
+}
+
+/// The byte offsets of the `run` fields in `ast` whose value is a string
+/// literal of more than [`MAX_INLINE_SCRIPT_LINES`] lines, with their
+/// line counts.
+fn long_inline_scripts(ast: &Ast<'_>) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    ast.traverse_ref(
+        &mut |node: &Ast<'_>, _: &()| {
+            if let Node::Record(record) = &node.node {
+                for field in record.field_defs {
+                    let is_run = matches!(field.path.last(),
+                        Some(FieldPathElem::Ident(id)) if id.label() == "run");
+                    let lines = field.value.as_ref().and_then(literal_lines);
+                    if let (true, Some(lines)) = (is_run, lines)
+                        && lines > MAX_INLINE_SCRIPT_LINES
+                    {
+                        let at = field.value.as_ref().and_then(|v| v.pos.into_opt());
+                        found.push((at.map_or(0, |span| span.start.to_usize()), lines));
+                    }
+                }
+            }
+            TraverseControl::<(), ()>::Continue
+        },
+        &(),
+    );
+    found
+}
+
+/// A source and what it imports, loaded into a fresh cache.
+struct Loaded {
+    cache: CacheHub,
+    /// The source's id.
+    main: FileId,
+    /// The ids of every file loaded.
+    ids: HashSet<FileId>,
+    /// Files imported as text, relative to the root, sorted.
+    texts: Vec<String>,
+}
+
 /// `source` and every file it imports, transitively, read through `repo`
-/// and loaded into a fresh cache. Returns the cache, the id of `source`
-/// and the ids of every file loaded.
-fn load(repo: &Repo, source: &str) -> Result<(CacheHub, FileId, HashSet<FileId>)> {
+/// and loaded into a fresh cache. A `run` field set to a literal longer
+/// than [`MAX_INLINE_SCRIPT_LINES`] is refused: a script that long goes
+/// in a file of its own, imported as text, where `wfc check` lints it.
+fn load(repo: &Repo, source: &str) -> Result<Loaded> {
     let mut cache = CacheHub::new();
     let alloc = AstAlloc::new();
     let mut loaded: HashMap<(String, InputFormat), FileId> = HashMap::new();
@@ -143,6 +204,14 @@ fn load(repo: &Repo, source: &str) -> Result<(CacheHub, FileId, HashSet<FileId>)
                 report(&cache, Error::ParseErrors(e))
             )
         })?;
+        if let Some((at, lines)) = long_inline_scripts(&ast).first() {
+            let line = cache.sources.source(id)[..*at].matches('\n').count() + 1;
+            bail!(
+                "{source} does not compile: {rel}:{line}: an inline `run` script of {lines} lines; \
+                 scripts of more than {MAX_INLINE_SCRIPT_LINES} lines go in a file of their own, \
+                 imported as text (`run = import \"scripts/x.sh\" as 'Text`), where `wfc check` lints them"
+            );
+        }
         let mut imports = Vec::new();
         ast.traverse_ref(
             &mut |node: &Ast<'_>, _: &()| {
@@ -169,7 +238,24 @@ fn load(repo: &Repo, source: &str) -> Result<(CacheHub, FileId, HashSet<FileId>)
         }
     }
     let main = main.expect("the source itself is always loaded");
-    Ok((cache, main, loaded.into_values().collect()))
+    let mut texts: Vec<String> = loaded
+        .keys()
+        .filter(|(_, format)| *format == InputFormat::Text)
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    texts.sort();
+    Ok(Loaded {
+        cache,
+        main,
+        ids: loaded.into_values().collect(),
+        texts,
+    })
+}
+
+/// The files `source` imports as text, transitively, relative to the
+/// root and sorted.
+pub fn text_imports(repo: &Repo, source: &str) -> Result<Vec<String>> {
+    on_big_stack(|| Ok(load(repo, source)?.texts))
 }
 
 /// Fails if nickel loaded a file that `load` didn't give it.
@@ -234,8 +320,14 @@ fn on_big_stack<T: Send>(f: impl FnOnce() -> Result<T> + Send) -> Result<T> {
 /// it as YAML, as `nickel export --format yaml` does.
 pub fn export_yaml(repo: &Repo, source: &str) -> Result<String> {
     on_big_stack(|| {
-        let (cache, main, ours) = load(repo, source)?;
-        evaluate(cache, main, &ours, source, ExportFormat::Yaml)
+        let loaded = load(repo, source)?;
+        evaluate(
+            loaded.cache,
+            loaded.main,
+            &loaded.ids,
+            source,
+            ExportFormat::Yaml,
+        )
     })
 }
 

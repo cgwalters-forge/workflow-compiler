@@ -8,9 +8,10 @@ pub mod actions;
 pub mod extract;
 pub mod nickel;
 pub mod repo;
+pub mod scripts;
 pub mod shape;
 
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -155,6 +156,16 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     problems.extend(shape::check_tree(root)?);
+    // The scripts the sources import; a source that failed to load was
+    // reported above.
+    let mut scripts = BTreeSet::new();
+    for source in sources.iter().chain(&accepts) {
+        if let Ok(texts) = nickel::text_imports(root, source) {
+            scripts.extend(texts);
+        }
+    }
+    let scripts: Vec<String> = scripts.into_iter().collect();
+    problems.extend(scripts::check(root, &scripts)?);
     let rejects = root.list(REJECT_DIR, ".ncl")?;
     for source in &rejects {
         let text = root.read(source)?.unwrap_or_default();
@@ -175,9 +186,13 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     eprintln!(
-        "checked {} lock files, {} accept tests, {} reject tests and {} locked actions",
+        "checked {} lock files, {} accept tests, {} scripts, {} reject tests and {} locked actions",
         sources.len(),
         accepts.len(),
+        scripts
+            .iter()
+            .filter(|s| s.ends_with(scripts::SCRIPT_SUFFIX))
+            .count(),
         rejects.len(),
         lock.len()
     );
