@@ -44,7 +44,7 @@ gha.compile {
     ],
     steps = [
       {
-        name = "Runs as the sandbox user",
+        name = "Runs as the sandbox user (renamed)",
         run = m%"
           id
           test "$(id -un)" = runner-sandbox
