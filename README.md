@@ -11,8 +11,10 @@ is the workflow file, so this project generates that file: a job is written
 in [nickel](https://nickel-lang.org/) as two phases, and the compiler (Rust,
 embedding nickel) emits a `.lock.yml` in which the second phase has no
 way to leave the sandbox.
-The background, the runner source analysis and the alternatives considered
-are in the [design gist](https://gist.github.com/cgwalters-bot/2368b70fa941386025467421ce38b5b6).
+What it guarantees, against whom, and the tests that prove it are in
+[docs/requirements.md](docs/requirements.md). The background, the runner
+source analysis and the alternatives considered are in the
+[design gist](https://gist.github.com/cgwalters-bot/2368b70fa941386025467421ce38b5b6).
 
 ## How a job is written
 
@@ -146,12 +148,26 @@ the task compiler that will produce this compiler's input):
 - [#15](https://github.com/cgwalters-forge/workflow-compiler/issues/15) credentials left in the workspace reach the sandbox (P1)
 - [#1](https://github.com/cgwalters-forge/workflow-compiler/issues/1) sandboxed step outputs reaching `with:` of allowlisted actions (P1)
 - [#8](https://github.com/cgwalters-forge/workflow-compiler/issues/8) using the compiler from other repositories (P1)
+- [#17](https://github.com/cgwalters-forge/workflow-compiler/issues/17) workflow commands on a sandboxed step's standard output (P1)
+- [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
+- [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20) caches saved from sandbox output and restored in `runner_steps` (P1)
+- [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25) expressions from issues, comments and pull requests in privileged `run:` steps (P1)
+- [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26) the stale-lock check runs the pull request's own compiler (P1)
+- [#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27) local sockets and localhost services reachable from the sandbox (P1)
 - [#14](https://github.com/cgwalters-forge/workflow-compiler/issues/14) prompts from a trusted ref for PR-triggered agents (P2)
 - [#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2) post-steps of `runner_steps` actions (P2)
 - [#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6) ubuntu-24.04, which has no `run0` (P2)
 - [#9](https://github.com/cgwalters-forge/workflow-compiler/issues/9) replacing the runner's last sudo rule (P2)
 - [#10](https://github.com/cgwalters-forge/workflow-compiler/issues/10) blocking the cloud metadata service for the sandbox (P2)
 - [#11](https://github.com/cgwalters-forge/workflow-compiler/issues/11) embedding `share.cjs` once per job (P2)
+- [#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18) a size cap on staged outputs (P2)
+- [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21) checking the repository settings the guarantee depends on (P2)
+- [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22) restricting the sandbox's network egress (P2)
+- [#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28) the enter step assumes an ephemeral runner (P2)
+- [#29](https://github.com/cgwalters-forge/workflow-compiler/issues/29) explicit token permissions (P2)
+- [#30](https://github.com/cgwalters-forge/workflow-compiler/issues/30) what pinned actions pull in (P2)
+- [#31](https://github.com/cgwalters-forge/workflow-compiler/issues/31) Docker container actions under rootless podman in the sandbox (P2)
+- [#32](https://github.com/cgwalters-forge/workflow-compiler/issues/32) the runner's loss of root depends on an opt-out and an untested setting (P2)
 
 ## License
 
