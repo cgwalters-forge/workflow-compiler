@@ -19,10 +19,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Write .github/workflows/*.lock.yml from workflows/*.ncl.
+    /// Write .github/workflows/*.lock.yml from workflows/*.ncl, locking
+    /// the metadata of new actions in actions.lock.json.
     Compile(Repo),
-    /// Fail if a lock file is stale or hand-edited, or if a source in
-    /// tests/reject/ compiles.
+    /// Fail if a lock file is stale or hand-edited, if
+    /// actions.lock.json doesn't match the action.yml files it holds, or
+    /// if a source in tests/reject/ compiles.
     Check(Repo),
 }
 
