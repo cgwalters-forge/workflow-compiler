@@ -85,7 +85,7 @@ let AgentRun = {
   # Minutes the agent may run, and its spend cap in AIC (1 AIC = $0.01).
   agent_timeout_minutes | Number | default = 10,
   budget_aic | Number | default = 500,
-  "runs-on" | String | default = "ubuntu-26.04",
+  "runs-on" | String | default = gha.default_runner,
   "timeout-minutes" | Number | default = 45,
 } in
 

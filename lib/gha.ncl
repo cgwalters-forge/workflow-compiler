@@ -20,6 +20,8 @@ let EXEC = "/usr/local/bin/runner-sandbox-exec" in
 let USER_RE = "^[a-z_][a-z0-9_-]{0,30}$" in
 # Where `share` runner steps publish (runtime/share.cjs has it too).
 let SHARE_DIR = "/etc/agent-share" in
+# The runner image of a job that doesn't set `runs-on`.
+let DEFAULT_RUNNER = "ubuntu-26.04" in
 
 let validator = fun pred msg =>
   std.contract.from_validator (fun v => if pred v then 'Ok else 'Error { message = msg v })
@@ -337,7 +339,7 @@ let Handoff = {
 
 let Job = {
   name | String | optional,
-  "runs-on" | Dyn,
+  "runs-on" | Dyn | default = DEFAULT_RUNNER,
   "timeout-minutes" | Number | optional,
   "if" | String | optional,
   needs | Dyn | optional,
@@ -1062,6 +1064,7 @@ in
 
 {
   share_dir = SHARE_DIR,
+  default_runner = DEFAULT_RUNNER,
   # Where publish_steps find what a `stage` step named NAME staged.
   staged = fun name => "%{STAGED_DIR}/%{name}",
   compile = fun source =>

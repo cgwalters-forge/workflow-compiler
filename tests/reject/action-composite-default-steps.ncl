@@ -4,7 +4,6 @@ gha.compile {
   name = "t",
   on = { push = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     steps = [{ uses = "wfc-test/composite-default-steps@0000000000000000000000000000000000000000" }],
   },
 }

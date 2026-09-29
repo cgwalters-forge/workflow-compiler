@@ -234,7 +234,8 @@ their imports against any path the job can read; confining that step is
 `Cargo.toml` pins it exactly; a bump can change the lock files, so it
 goes with `cargo run -- compile`. wfc builds with the toolchain in
 `rust-toolchain.toml`. Sandboxed steps need `run0`, so systemd 256 or
-later: ubuntu-26.04 and RHEL 10, not ubuntu-24.04
+later: ubuntu-26.04, which a job runs on unless it sets `runs-on`, and
+RHEL 10, not ubuntu-24.04
 ([#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6)).
 
 ## Status and roadmap

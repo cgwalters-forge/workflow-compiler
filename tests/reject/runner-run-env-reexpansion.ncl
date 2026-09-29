@@ -4,7 +4,6 @@ gha.compile {
   name = "t",
   on = { issues = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     runner_steps = [{ env = { TITLE = "${{ github.event.issue.title }}" }, run = "echo \"${{ env.TITLE }}\"" }],
     steps = [{ run = "id" }],
   },

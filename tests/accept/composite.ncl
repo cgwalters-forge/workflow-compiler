@@ -9,7 +9,6 @@ gha.compile {
   name = "t",
   on = { push = {} },
   jobs.t = {
-    "runs-on" = "ubuntu-26.04",
     steps = [
       { id = "build", run = m%"echo "v=1" >>"$GITHUB_OUTPUT""% },
       { id = "greet", uses = composite, with.who = "${{ steps.build.outputs.v }}" },
