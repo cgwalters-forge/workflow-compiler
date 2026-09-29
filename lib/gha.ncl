@@ -78,6 +78,18 @@ let Allowed = fun allowed => validator
   (fun step => "`%{step.uses}` is not in sandbox.allowed_actions; after the privileged phase an action runs as the runner user with the job's tokens")
 in
 
+# checkout leaves the job's token in .git/config unless told not to, and
+# the hand-off would give it to the sandbox (it also refuses such a copy).
+let NoPersistedCredentials = validator
+  (fun step =>
+    !(std.record.has_field "uses" step)
+    || !(std.string.is_match "(?i)^actions/checkout@" step.uses)
+    || (std.record.has_field "with" step
+      && std.record.has_field "persist-credentials" step.with
+      && (step.with."persist-credentials" == false || step.with."persist-credentials" == "false")))
+  (fun step => "`%{step.uses}` must set `with.persist-credentials = false`: the token it would leave in .git/config is readable by the sandbox after the hand-off")
+in
+
 let RunnerStep = std.contract.Sequence [
   {
     name | String | optional,
@@ -93,6 +105,7 @@ let RunnerStep = std.contract.Sequence [
     "timeout-minutes" | Number | optional,
   },
   OneOfRunUses,
+  NoPersistedCredentials,
 ] in
 
 # A `share` runner step publishes a file or directory tree from the
@@ -187,6 +200,26 @@ let Sandbox = {
   allowed_actions | Array String | default = [],
 } in
 
+# A relative path in the workspace, without `.` or `..` components.
+let WorkspacePath = fun what => validator
+  (fun s => std.string.is_match "^[^/]+(/[^/]+)*$" s && !(std.string.is_match "(^|/)\\.\\.?(/|$)" s) && !(std.string.contains "${{" s))
+  (fun s => "%{what} `%{s}` must be relative to the workspace, without `.`, `..` or an expression (Actions would expand it into the enter step's script, which runs as root)")
+in
+
+# What the enter step copies from the runner's workspace into the
+# sandbox's (runtime/handoff.cjs). Nothing else of the runner's crosses,
+# and a copy holding credentials (checkout's token, an .npmrc token) is
+# refused.
+let Handoff = {
+  # 'tracked: the files git tracks, so nothing a setup step generated or
+  # downloaded comes along unless listed in `include`; 'all: the whole
+  # workspace; 'none: an empty directory.
+  workspace | [| 'tracked, 'all, 'none |] | default = 'tracked,
+  # More workspace paths to copy with 'tracked (e.g. `.git`, or what
+  # runner_steps generated).
+  include | Array (WorkspacePath "handoff.include path") | default = [],
+} in
+
 let Job = {
   name | String | optional,
   "runs-on" | Dyn,
@@ -195,6 +228,7 @@ let Job = {
   needs | Dyn | optional,
   permissions | { _ : String } | optional,
   sandbox | Sandbox | default = {},
+  handoff | Handoff | default = {},
   # RunnerStep or ShareStep, checked in compile_job.
   runner_steps | Array Dyn | default = [],
   steps | Array Dyn,
@@ -209,10 +243,11 @@ let Workflow = {
   jobs | { _ : Job },
 } in
 
-let install_step = fun sandbox =>
+let install_step = fun sandbox job_handoff =>
   let config = {
     user = sandbox.user,
     lockRunnerSudo = sandbox.lock_runner_sudo,
+    handoff = { workspace = std.string.from_enum job_handoff.workspace, include = job_handoff.include },
     # Expanded by Actions when the step runs.
     workspace = "${{ github.workspace }}",
   }
@@ -220,11 +255,12 @@ let install_step = fun sandbox =>
   {
     name = "Enter the sandbox (generated)",
     # sudo resets the environment; the runner's NOPASSWD: ALL rule allows
-    # keeping these two.
-    shell = "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS node {0}",
+    # keeping these.
+    shell = "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS node {0}",
     env = {
       RUNNER_SANDBOX_EXEC_JS = import "../runtime/exec.cjs" as 'Text,
       RUNNER_SANDBOX_RUN_JS = import "../runtime/run.cjs" as 'Text,
+      RUNNER_SANDBOX_HANDOFF_JS = import "../runtime/handoff.cjs" as 'Text,
     },
     run = "const CONFIG = %{std.serialize 'Json config};\n" ++ (import "../runtime/install.cjs" as 'Text),
   }
@@ -296,7 +332,7 @@ let upload_steps = fun step =>
   ]
 in
 
-let COMPILER_FIELDS = ["sandbox", "runner_steps", "steps"] in
+let COMPILER_FIELDS = ["sandbox", "handoff", "runner_steps", "steps"] in
 
 let compile_job = fun job =>
   let sandbox = job.sandbox in
@@ -311,7 +347,7 @@ let compile_job = fun job =>
   in
   job
   |> std.record.filter (fun name _v => !(std.array.elem name COMPILER_FIELDS))
-  |> std.record.insert "steps" (std.array.map runner_step job.runner_steps @ [secure_host_step, install_step sandbox] @ steps)
+  |> std.record.insert "steps" (std.array.map runner_step job.runner_steps @ [secure_host_step, install_step sandbox job.handoff] @ steps)
 in
 
 {

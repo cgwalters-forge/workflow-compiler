@@ -1,9 +1,10 @@
 // The compiler-generated "enter the sandbox" step, run as root (`sudo node`)
 // right after the job's runner_steps. The compiler prepends
 // `const CONFIG = {...};` to this file and passes the two halves of the step
-// wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS.
+// wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, and the
+// workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS.
 //
-// It creates the sandbox user, gives it a copy of the workspace, installs
+// It creates the sandbox user, hands it the workspace, installs
 // the two halves of the step wrapper, and (with CONFIG.lockRunnerSudo) takes
 // root away from the runner user, whose only remaining sudo rule is the
 // wrapper. From here on, the job's run steps execute as the sandbox user.
@@ -39,20 +40,42 @@ const runner = process.env.SUDO_USER;
 if (!runner || runner === "root") throw new Error("must be started with sudo by the runner user");
 const user = CONFIG.user;
 
+// A runner that ran a job before would hand this one the previous job's
+// sandbox and workspace: refuse it. (The user itself may come with the
+// image, as on the devspace runners.)
+if (fs.existsSync(path.dirname(WORKDIR))) {
+  throw new Error(`${path.dirname(WORKDIR)} already exists: the sandbox needs a fresh, ephemeral runner`);
+}
 if (run("getent", ["passwd", user], { check: false }).status !== 0) {
   run("useradd", ["--create-home", "--user-group", "--shell", "/bin/bash", user]);
 }
 const sandbox = passwd(user);
 const runnerHome = passwd(runner).home;
 
-// The sandbox works on its own copy of the checkout; the runner's home,
-// which holds the runner's credentials and the job's temp files, is closed.
-fs.mkdirSync(WORKDIR, { recursive: true });
-run("cp", ["-a", `${CONFIG.workspace}/.`, WORKDIR]);
-run("chown", ["-R", `${sandbox.uid}:${sandbox.gid}`, WORKDIR]);
+fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o755 });
+// The sandbox works on its own copy of what the job hands it (the files git
+// tracks, by default); the runner's home, which holds the runner's
+// credentials and the job's temp files, is closed.
+const HANDOFF = `${CONFIG_DIR}/handoff.cjs`;
+fs.writeFileSync(HANDOFF, process.env.RUNNER_SANDBOX_HANDOFF_JS ?? "", { mode: 0o644 });
+const { handoff } = require(HANDOFF);
+const copied = handoff({
+  workspace: CONFIG.workspace,
+  dest: WORKDIR,
+  mode: CONFIG.handoff.workspace,
+  include: CONFIG.handoff.include,
+  owner: sandbox,
+  // As runner, whose checkout it is: git as root would read the runner's
+  // repository configuration.
+  listTracked: () => {
+    const r = spawnSync("runuser", ["-u", runner, "--", "git", "-C", CONFIG.workspace, "ls-files", "-z", "-s"], { encoding: "utf8", maxBuffer: 1 << 30 });
+    if (r.status !== 0) throw new Error(`handoff.workspace = 'tracked needs a git checkout in ${CONFIG.workspace} (use 'all or 'none otherwise): ${(r.stderr ?? "").trim()}`);
+    return r.stdout;
+  },
+});
+console.log(`Handed ${copied} workspace entries (${CONFIG.handoff.workspace}) to ${user} in ${WORKDIR}`);
 fs.chmodSync(runnerHome, 0o700);
 
-fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o755 });
 fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, runnerHome }), { mode: 0o644 });
 // runner-sandbox-run runs as root under this node, through the one sudo
 // rule runner keeps, so the binary and every directory above it must be
