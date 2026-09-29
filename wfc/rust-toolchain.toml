@@ -1,0 +1,5 @@
+# The toolchain ci builds and lints with, so clippy's lints don't drift
+# under it; bump it deliberately.
+[toolchain]
+channel = "1.92"
+components = ["rustfmt", "clippy"]
