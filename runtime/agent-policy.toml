@@ -1,0 +1,21 @@
+# How bot-harness answers the agent's permission requests in an agent_run
+# job (see harness/src/policy.rs in cgwalters-devspace-sandbox). The
+# sandbox is the security boundary; this keeps the agent from actions a
+# task run shouldn't take, and records every decision in the transcript.
+# It is devspace-sandbox's harness/policy.toml with the compiled job's
+# paths: the sandbox's workspace and home.
+default = "allow"
+
+# Results leave through the run's staged artifacts, reviewed before
+# anything is pushed from outside the sandbox.
+[[rule]]
+name = "no-push"
+decision = "deny"
+kind = ["execute"]
+command = '\bgit\b.*\bpush\b'
+
+[[rule]]
+name = "writes-in-workspace-or-home-only"
+decision = "deny"
+kind = ["edit", "delete", "move"]
+outside = ["/var/lib/runner-sandbox/work", "/home/runner-sandbox"]

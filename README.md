@@ -165,9 +165,41 @@ bundled node20 or node24.
 jobs.review = agent_run { prompt = "/etc/agent-share/agentskills/review.md" }
 ```
 
-It checks out the repository, shares `agentskills/`, installs the agent,
-and runs it in the sandbox on a prompt nothing in the sandbox could have
-rewritten. It is a compiler macro rather than a composite action because a
+It checks out the repository and shares `agentskills/`. It then runs the
+agent in the sandbox, on a prompt nothing in the sandbox could have
+rewritten, through bot-harness, the Agent Client Protocol client from
+cgwalters-devspace-sandbox. bot-harness records the transcript, answers
+permission requests from its policy, enforces the timeout and budget, and
+writes the task layer's `summary.json` (`runtime/agent-run.cjs`). The run
+summary and transcript come out as `agent-run` and `agent-transcript`
+artifacts, through the stage, seal and publish phases.
+
+Those harness features hold only for an agent that cooperates. The agent
+runs as the same user as bot-harness, so a hostile one can skip
+permission requests, kill or outlive the harness, and rewrite what it
+wrote. So the summary and transcript are the agent's own data, as
+untrusted as anything else from the sandbox. What bounds a hostile agent
+is the sandbox: the step's `timeout-minutes`, the agent's timeout plus a
+few minutes' grace, after which the wrapper stops every process of the
+step, and the uid boundary. Spend caps will be praxis's, not the
+harness's (#36). The scripted agent also tries the escapes the old stub
+checked for: rewriting its prompt, adding to a share, sudo, reading
+`Runner.Worker`'s environment or the runner's home, and seeing the job's
+tokens. `ci` requires every one to have failed, from the transcript.
+
+bot-harness runs inside the sandbox together with the agent. It holds
+nothing the agent may not see, so unlike in devspace-sandbox's `agent.yml`
+it needs no sudo to start the agent as another user. The privileged phase
+builds it from a pinned commit of cgwalters-devspace-sandbox, as a setup
+step. That takes a few minutes, but it needs no release infrastructure. It
+isn't a shimmed action, because it isn't one. The better form is a release
+artifact pinned by sha256, which the compiler would download and check,
+once that repository publishes one. Only the scripted `fake` agent runs
+for now. How real inference plugs in (praxis run tokens, registered in the
+privileged phase, handed to the sandbox alone, ended in the publish phase)
+is [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36).
+
+`agent_run` is a compiler macro rather than a composite action because a
 composite action runs as `runner` and can't constrain the job around it
 ([#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4)).
 
@@ -215,15 +247,18 @@ request:
   run in the sandbox through the shim (a linter, setup-node, and the
   composite crate-ci/typos), and `GITHUB_ENV`, `GITHUB_PATH` and multi-line
   outputs work there without reaching the runner;
-- `workflows/agent-review.ncl` on hosted ubuntu-26.04, with a stub agent
-  (`runtime/agent-stub.sh`) that reads its prompt from the share and fails
-  if it can rewrite it, use sudo or see the job's credentials.
+- `workflows/agent-review.ncl` on hosted ubuntu-26.04: bot-harness, built
+  at a pinned commit in the privileged phase, runs its scripted ACP agent
+  in the sandbox on a prompt from a share, and `ci` checks the
+  `agent-run` (summary.json, summary.md, condensed.log) and
+  `agent-transcript` (acp.jsonl) artifacts that come out of the publish
+  phase.
 
 Next, as issues in this repository (sub-issues of
 [tracker#88](https://github.com/cgwalters-forge/tracker/issues/88),
 the task compiler that will produce this compiler's input):
 
-- [#7](https://github.com/cgwalters-forge/workflow-compiler/issues/7) run a real agent through the devspace harness (P1)
+- [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36) `agent_run` with real inference through praxis run tokens (P1)
 - [#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4) agent-run as a compiler macro or a composite action (P1)
 - [#5](https://github.com/cgwalters-forge/workflow-compiler/issues/5) use `cgwalters-forge/actions/secure-host-setup` (P1)
 - [#13](https://github.com/cgwalters-forge/workflow-compiler/issues/13) the stale-lock check doesn't prove every workflow is compiled (P1)
