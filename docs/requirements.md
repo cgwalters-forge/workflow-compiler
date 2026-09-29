@@ -239,22 +239,28 @@ running. The hand-off doesn't carry credentials in either: a checkout must
 set `persist-credentials: false`, and the copy is refused if it finds
 credentials a setup step left in the workspace.
 
-**Status:** partial. The environment, `Runner.Worker` and the runner's home
-hold. The runner's files are hidden by closing its home, which assumes the
-hosted layout, where the workspace, the runner's installation and its
-`.credentials` all live under `/home/runner`. The hand-off in #12 copies
-the whole workspace, `.git` included, and nothing enforces
-`persist-credentials: false`, so checkout's token can reach the sandbox
-([#15](https://github.com/cgwalters-forge/workflow-compiler/issues/15)).
-The cloud metadata service
+**Status:** partial. The environment, `Runner.Worker`, the runner's home
+and the hand-off hold: it copies only what git tracks unless the job says
+otherwise (`handoff.workspace`, `handoff.include`), refuses known
+credential files and GitHub tokens in any file that differs from what git
+tracks (a value that only names an environment variable, like an
+`.npmrc`'s `${NPM_TOKEN}`, is fine), and the compiler refuses a checkout
+without `persist-credentials: false`. The scan knows a list of files; a
+credential elsewhere in another format isn't found. The runner's files are hidden by closing its
+home, which assumes the hosted layout, where the workspace, the runner's
+installation and its `.credentials` all live under `/home/runner`. The
+cloud metadata service
 ([#10](https://github.com/cgwalters-forge/workflow-compiler/issues/10)) and
 local sockets and services
 ([#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27)) are
 reachable.
 
 **Proof:** `sandbox-test` steps "The job's credentials are out of reach"
-and the `sandbox-test-artifacts` job, which fails if any artifact holds the
-runtime token or the runner's secret marker.
+and "Gets the handed-off workspace and nothing else", and the
+`sandbox-test-artifacts` job, which fails if any artifact holds the
+runtime token or the runner's secret marker; the hand-off's unit tests in
+`tests/runtime/handoff.test.cjs` (credential files, symlinks, special
+files); `tests/reject/checkout-persist-credentials.ncl`.
 
 ### R4. The runner loses root before untrusted code runs
 
@@ -287,9 +293,10 @@ step and before the next, so a step killed by its timeout or a cancel
 leaves processes running until the next sandboxed step starts; after the
 last one, they run next to the steps that follow, until the seal
 ([#16](https://github.com/cgwalters-forge/workflow-compiler/issues/16))
-stops them. This assumes an ephemeral runner: on a persistent one, the
-sandbox user and its files carry over into the next job
-([#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28)).
+stops them. This assumes an ephemeral runner: the enter step refuses a
+runner that already has the sandbox's directory, but a persistent runner
+would still carry the sandbox user's own files and processes over into the
+next job ([#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28)).
 
 **Proof:** `sandbox-test` steps "Leave a process behind", "Leave a process
 behind and time out", "Cron, at and lingering are denied" and "The escapes
