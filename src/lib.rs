@@ -6,6 +6,7 @@
 pub mod actions;
 pub mod extract;
 pub mod nickel;
+pub mod pins;
 pub mod repo;
 pub mod scripts;
 pub mod shape;
@@ -160,6 +161,7 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     problems.extend(shape::check_tree(root)?);
+    problems.extend(pins::check(root)?);
     let loaded: Vec<String> = loaded.into_iter().collect();
     problems.extend(scripts::check(root, &loaded)?);
     let rejects = root.list(REJECT_DIR, ".ncl")?;
