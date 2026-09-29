@@ -1,6 +1,6 @@
 # Provision the machine as `runner`, then run as the sandbox user and check
 # that the sandbox holds nothing of the job's credentials and that escape
-# attempts fail. ci.yml runs it; compiled to
+# attempts fail, then publish as runner from what the sandbox staged. ci.yml runs it; compiled to
 # .github/workflows/sandbox-test.lock.yml.
 let gha = import "../lib/gha.ncl" in
 let checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" in # v7.0.1
@@ -69,6 +69,21 @@ gha.compile {
           loginctl show-session "$XDG_SESSION_ID" -p Name -p Class
           test "$(loginctl show-session "$XDG_SESSION_ID" -p Name --value)" = runner-sandbox
           if env | grep ^SUDO_; then echo "SUDO_* leaked into the sandbox"; exit 1; fi
+        "%,
+      },
+      {
+        name = "Leave files in /tmp and /var/tmp",
+        run = m%"
+          echo left >/tmp/sandbox-tmp-marker
+          echo left >/var/tmp/sandbox-tmp-marker
+        "%,
+      },
+      {
+        name = "Each step gets a private /tmp and /var/tmp",
+        run = m%"
+          for d in /tmp /var/tmp; do
+            if test -e "$d/sandbox-tmp-marker"; then echo "$d is shared between steps"; exit 1; fi
+          done
         "%,
       },
       { name = "sudo is refused", id = "sudo", "continue-on-error" = true, run = "sudo -n true" },
@@ -199,10 +214,10 @@ gha.compile {
       {
         name = "Every upload through a symlink was refused",
         env = {
-          ENVIRON = "${{ steps.collect-leak-environ.outcome }}",
-          RUNNER = "${{ steps.collect-leak-runner.outcome }}",
-          VIA = "${{ steps.collect-leak-via.outcome }}",
-          DIR = "${{ steps.collect-leak-dir.outcome }}",
+          ENVIRON = "${{ steps.stage-leak-environ.outcome }}",
+          RUNNER = "${{ steps.stage-leak-runner.outcome }}",
+          VIA = "${{ steps.stage-leak-via.outcome }}",
+          DIR = "${{ steps.stage-leak-dir.outcome }}",
         },
         run = m%"
           echo "environ=$ENVIRON runner=$RUNNER via=$VIA dir=$DIR"
@@ -210,6 +225,54 @@ gha.compile {
         "%,
       },
       { "if" = "always()", upload = { name = "sandbox-test", path = "hello.log" } },
+      # What publish_steps get: a staged copy, and nothing else of the
+      # sandbox's.
+      {
+        name = "Write a report, and leave files where publish steps might look",
+        run = m%"
+          echo "report from $(id -un)" >report.txt
+          echo leftover >/dev/shm/sandbox-leftover
+          # One owned by a subordinate uid, through rootless podman.
+          podman unshare sh -c 'echo leftover >/dev/shm/subuid-leftover && chown 1:1 /dev/shm/subuid-leftover'
+          test "$(stat -c %u /dev/shm/subuid-leftover)" != "$(id -u)"
+          mkdir -p ~/private && echo secret-ish >~/private/notes
+        "%,
+      },
+      { stage = { name = "report", path = "report.txt" } },
+    ],
+    publish_steps = [
+      {
+        name = "Read the staged report, as runner",
+        id = "read-report",
+        run = m%"
+          test "$(id -un)" = runner
+          f=%{gha.staged "report"}/report.txt
+          test "$(cat "$f")" = "report from runner-sandbox"
+          test "$(stat -c '%U:%G %a' "$f")" = "root:root 644"
+          echo "lines=$(wc -l <"$f")" >>"$GITHUB_OUTPUT"
+        "%,
+      },
+      {
+        name = "The sandbox is sealed",
+        env = { LINES = "${{ steps.read-report.outputs.lines }}" },
+        run = m%"
+          test "$LINES" = 1
+          for p in /var/lib/runner-sandbox/work/report.txt /home/runner-sandbox/private/notes; do
+            if cat "$p" 2>/dev/null; then echo "read $p after the seal"; exit 1; fi
+          done
+          for f in /dev/shm/sandbox-leftover /dev/shm/subuid-leftover; do
+            if test -e "$f"; then echo "the sandbox's $f survived the seal"; exit 1; fi
+          done
+          if pgrep -u runner-sandbox; then echo "a sandbox process survived the seal"; exit 1; fi
+          if /usr/local/bin/runner-sandbox-exec --stage late report.txt; then echo "staged after the seal"; exit 1; fi
+          if sudo -n true 2>/dev/null; then echo "runner has sudo in the publish phase"; exit 1; fi
+          # Same uid as Runner.Worker, but Yama keeps it from its memory.
+          worker=$(pgrep -f Runner.Worker | head -n1)
+          test -n "$worker"
+          if (exec 3<"/proc/$worker/mem") 2>/dev/null; then echo "opened Runner.Worker's memory"; exit 1; fi
+          echo "only staged outputs are left"
+        "%,
+      },
     ],
   },
 }
