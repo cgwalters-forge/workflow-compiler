@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   trusted-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       # Paths whose change is a change of the compiler, reviewed by hand.

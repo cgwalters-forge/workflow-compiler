@@ -10,7 +10,6 @@ gha.compile {
   on = { workflow_call = {}, workflow_dispatch = {} },
   permissions = { contents = "read" },
   jobs.sandbox = {
-    "runs-on" = "ubuntu-26.04",
     "timeout-minutes" = 15,
     sandbox.user = "runner-sandbox",
     # What git tracks, plus what a runner step generates below.

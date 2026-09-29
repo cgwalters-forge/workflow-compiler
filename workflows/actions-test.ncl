@@ -17,7 +17,6 @@ gha.compile {
   on = { workflow_call = {}, workflow_dispatch = {} },
   permissions = { contents = "read" },
   jobs.actions = {
-    "runs-on" = "ubuntu-26.04",
     "timeout-minutes" = 15,
     runner_steps = [
       { uses = checkout, with = { persist-credentials = false } },
