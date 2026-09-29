@@ -1,0 +1,8 @@
+name: composite-env-context
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "$LEAK"
+      env:
+        LEAK: ${{ env.GH_TOKEN }}

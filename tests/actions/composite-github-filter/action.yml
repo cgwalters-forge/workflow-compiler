@@ -1,0 +1,6 @@
+name: composite-github-filter
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo '${{ join(github.*, ',') }}'

@@ -105,14 +105,32 @@ environment and `PATH` changes apply to later sandboxed steps only; state
 goes to the action's post step, which runs after the last sandboxed step.
 `GITHUB_WORKSPACE`, `RUNNER_TEMP` and `RUNNER_TOOL_CACHE` are the
 sandbox's own directories, so setup actions install into a tool cache the
-sandbox owns.
+sandbox owns. A composite action is expanded at compile time into sandboxed
+steps, with `inputs.*`, `github.action_path` and its step ids rewritten
+into the caller's job.
+
+What an action's metadata says is its author's text, not the workflow
+author's, yet it ends up in the lock file, where Actions evaluates its
+expressions with the job's contexts. So the compiler holds it to
+allowlists. Names and entry points must be plain. Expressions in input
+defaults, composite steps' `run`, `env`, `with`, `if` and names, and
+outputs may use only literals, operators, a few functions, the action's
+own inputs and steps, and contexts that hold no credentials
+(`github.repository`, `github.sha`, `runner.os`, the sandbox's paths and
+the like). The caller's steps, `env`, `vars`, `needs`, `secrets`,
+`github.token` and `github.event` are all out. The step's env names never
+become the runner-side wrapper's own variables: each value goes under a
+fixed name, and `exec.cjs` gives it its name in the request, which the
+root side checks again. Fixtures in `tests/actions/` (locked as
+`wfc-test/<name>`) are hostile actions that the reject tests require to
+fail, and well-behaved ones whose compiled output `tests/accept/` checks.
 
 `compile.mjs` locks the metadata of every such action: nickel can't fetch
 anything, so it adds an action to `actions.lock.json` when a source needs
 one, and `--check` verifies each entry against the `action.yml` it holds.
-`workflows/actions-test.ncl` runs DavidAnson/markdownlint-cli2-action
-and actions/setup-node (Node 22 into the sandbox's tool cache) on hosted
-ubuntu-26.04.
+`workflows/actions-test.ncl` runs DavidAnson/markdownlint-cli2-action,
+actions/setup-node (Node 22 into the sandbox's tool cache) and
+crate-ci/typos (a composite action) on hosted ubuntu-26.04.
 
 Some actions can't run this way, and the compiler says so:
 
@@ -124,7 +142,13 @@ Some actions can't run this way, and the compiler says so:
 - Docker container actions: the sandbox has no container engine running as
   root ([#31](https://github.com/cgwalters-forge/workflow-compiler/issues/31));
 - actions with a `pre` entry point;
-- composite actions, for now;
+- actions whose text uses a context outside the allowlist above (an input
+  default naming the token or secrets is dropped instead, so the action
+  sees an empty input);
+- composite actions whose steps use another shell than bash or sh, set
+  `working-directory`, use an action that isn't pinned by commit or is a
+  local `./` path, or pass `inputs` in a form the compiler can't rewrite
+  (an input that mixes text and expressions);
 - actions that assume they run as runner: writing outside the workspace,
   `RUNNER_TEMP` and `RUNNER_TOOL_CACHE`, using sudo, or reading the event
   payload (`GITHUB_EVENT_PATH` isn't set in the sandbox). Those belong in
@@ -177,9 +201,9 @@ request:
   seal, publish steps read the staged report as runner but not the
   sandbox's workspace, home or leftovers in `/dev/shm`;
 - `workflows/actions-test.ncl` on hosted ubuntu-26.04: marketplace actions
-  run in the sandbox through the shim (a linter and setup-node), and
-  `GITHUB_ENV`, `GITHUB_PATH` and multi-line outputs work there without
-  reaching the runner;
+  run in the sandbox through the shim (a linter, setup-node, and the
+  composite crate-ci/typos), and `GITHUB_ENV`, `GITHUB_PATH` and multi-line
+  outputs work there without reaching the runner;
 - `workflows/agent-review.ncl` on hosted ubuntu-26.04, with a stub agent
   (`runtime/agent-stub.sh`) that reads its prompt from the share and fails
   if it can rewrite it, use sudo or see the job's credentials.
