@@ -64,6 +64,23 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint"
 
+  # The Rust front end (wfc/), which embeds nickel: its golden tests
+  # compile every source in workflows/ to the committed lock files, and
+  # every reject test to its message.
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: wfc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
   # The compiled workflows themselves, on real hosted runners.
   sandbox-test:
     uses: ./.github/workflows/sandbox-test.lock.yml
@@ -89,7 +106,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, compile, sandbox-test, sandbox-test-artifacts, agent-review, actions-test]
+    needs: [lint, compile, rust, sandbox-test, sandbox-test-artifacts, agent-review, actions-test]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed

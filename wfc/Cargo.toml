@@ -1,0 +1,24 @@
+[package]
+name = "workflow-compiler"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Compile nickel workflow sources into sandboxed GitHub Actions lock files"
+publish = false
+
+[[bin]]
+name = "wfc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Confines what a compile can read to the repository (see confine_reads).
+landlock = "0.4"
+# Outside nickel's 1.0 stability promise, so pinned exactly. 0.19.0 is the
+# core of nickel-lang-cli 1.18.0, which compile.mjs runs in ci
+# (NICKEL_VERSION in .github/workflows/ci.yml): the two move together,
+# since the golden tests compare their outputs byte for byte.
+nickel-lang-core = { version = "=0.19.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

@@ -181,6 +181,27 @@ It needs `nickel` on `PATH` (or `$NICKEL`); `ci.yml` shows how to fetch the
 pinned release. Sandboxed steps need `run0`, so systemd 256 or later:
 ubuntu-26.04 and RHEL 10, not ubuntu-24.04 ([#6](https://github.com/cgwalters-forge/workflow-compiler/issues/6)).
 
+`wfc/` is the Rust front end that will replace `compile.mjs` and the
+downloaded binary
+([#3](https://github.com/cgwalters-forge/workflow-compiler/issues/3)): it
+embeds `nickel-lang-core`, pinned to the version nickel 1.18.0 uses, and
+evaluates the same sources in-process. So far it compiles and checks lock
+files (`cargo run --manifest-path wfc/Cargo.toml -- --check
+workflows/sandbox-test.ncl`); its golden tests (`cargo test`) require the
+output to match what `compile.mjs` wrote, byte for byte, for every source
+and accept test, and every reject test to fail with its message. Before it compiles
+anything it confines its own reads with Landlock to what a compile needs
+(`lib/`, `runtime/`, `workflows/`, `tests/`, `actions.lock.json` and the
+lock files, refusing any of them that is a symlink or resolves outside
+the repository, plus each source file itself; not `.git` or the rest of
+the checkout), since
+nickel resolves an `import` against any path (`/etc/passwd`, `../x`, a
+symlink out of the tree), and a source may come from a pull request
+([#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26));
+`compile.mjs` and the nickel binary have no such confinement. It builds
+with the toolchain in `wfc/rust-toolchain.toml`. It doesn't fetch
+`actions.lock.json` entries or write lock files yet.
+
 ## Status and roadmap
 
 This is a proof of concept. What works now, checked by `ci` on every pull
