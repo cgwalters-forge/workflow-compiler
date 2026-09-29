@@ -18,10 +18,14 @@
 # `env:`) is an error rather than silently passed through.
 let EXEC = "/usr/local/bin/runner-sandbox-exec" in
 let USER_RE = "^[a-z_][a-z0-9_-]{0,30}$" in
-# Where `share` runner steps publish (runtime/share.cjs has it too).
+# Where `share` runner steps publish (the sandbox-share action has it too).
 let SHARE_DIR = "/etc/agent-share" in
 # The runner image of a job that doesn't set `runs-on`.
 let DEFAULT_RUNNER = "ubuntu-26.04" in
+# The compiler's own actions (github.com/cgwalters-forge/actions), which
+# generated steps use, all from one commit: cgwalters-forge/actions#7's
+# head until it merges (#47).
+let SHARED_ACTIONS = "cgwalters-forge/actions@f1cc343b8404c22aadbc8c5a7d0923dae4015179" in # cgwalters-forge/actions#7
 
 let validator = fun pred msg =>
   std.contract.from_validator (fun v => if pred v then 'Ok else 'Error { message = msg v })
@@ -167,7 +171,7 @@ let RunnerStep = std.contract.Sequence [
 
 # A `share` runner step publishes a file or directory tree from the
 # runner's side as a root-owned, world-readable copy at
-# SHARE_DIR/<name> (runtime/share.cjs): the sandbox can read it but not
+# SHARE_DIR/<name> (the sandbox-share action): the sandbox can read it but not
 # change it, so it's where the privileged phase hands the sandbox its
 # instructions (an agent's prompt and skills, a config).
 let ShareName = validator
@@ -190,7 +194,7 @@ let ShareStep = {
     {
       name | ShareName,
       # A file or directory in the workspace; symlinks are refused.
-      path | ShareNoCredentials | optional,
+      path | std.string.NonEmpty | ShareNoCredentials | optional,
       # Or the file's content.
       content | ShareNoCredentials | optional,
     },
@@ -406,17 +410,22 @@ let secure_host_step = {
   run = import "../runtime/secure-host.cjs" as 'Text,
 } in
 
+# `name` in the shared actions, at SHARED_ACTIONS' commit.
+let shared_action = fun name =>
+  let repo_sha = std.string.split "@" SHARED_ACTIONS in
+  "%{std.array.at 0 repo_sha}/%{name}@%{std.array.at 1 repo_sha}"
+in
+
 let share_step = fun step =>
   let share = step.share in
-  let source = if std.record.has_field "path" share then { SHARE_PATH = share.path } else { SHARE_CONTENT = share.content } in
+  let source = if std.record.has_field "path" share then { path = share.path } else { content = share.content } in
   step
   |> std.record.remove "share"
   |> (fun s => if std.record.has_field "name" s then s else std.record.insert "name" "Share %{share.name} as %{SHARE_DIR}/%{share.name} (generated)" s)
-  # Settings go through env, where Actions expands expressions into data, not
-  # into the script's source.
-  |> std.record.insert "env" ({ SHARE_NAME = share.name } & source)
-  |> std.record.insert "shell" "sudo --preserve-env=SHARE_NAME,SHARE_PATH,SHARE_CONTENT node {0}"
-  |> std.record.insert "run" (import "../runtime/share.cjs" as 'Text)
+  # Inputs reach its script as environment variables, where Actions
+  # expands expressions into data, not into the script's source.
+  |> std.record.insert "uses" (shared_action "sandbox-share")
+  |> std.record.insert "with" ({ name = share.name } & source)
 in
 
 let runner_step = fun step =>
