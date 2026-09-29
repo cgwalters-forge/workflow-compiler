@@ -1,0 +1,10 @@
+# Text that looks like the compiler's own placeholders.
+name: composite-placeholder
+inputs:
+  x:
+    default: a
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "@@wfc-i0@@ ${{ inputs.x }}"

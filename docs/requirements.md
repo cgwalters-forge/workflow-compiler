@@ -358,16 +358,17 @@ upload steps that point at
 runner. Before they start, the seal step stops every sandbox process and
 makes the sandbox's workspace and home unreadable to runner, and removes
 what the sandbox left in world-writable directories (found on every
-mounted filesystem but the kernel's own; the seal fails if it can't
-search one), owned by its uid or gid or by
-the subordinate ids rootless podman maps its containers to. So a publish
-step can only read what the sandbox staged. If the seal fails, no publish
-step runs. The compiler rejects expressions in a publish step's `run`,
-`working-directory`, `with` or `env` that use a sandboxed step's outputs,
-since those are strings the sandbox chose. A
-step's `outcome` and `conclusion` are allowed: they are one of four fixed
-values, so the most the sandbox can do with them (by its exit status) is
-decide whether a publish step runs, which it can do anyway.
+mounted filesystem but the kernel's own; the seal fails if it can't search
+one), owned by its uid or gid or by the subordinate ids rootless podman
+maps its containers to. So a publish step can only read what the sandbox
+staged. If the seal fails, no publish step runs. The seal also removes
+what the sandbox set for its own later steps (the `GITHUB_ENV` store) and
+its actions' saved state. The compiler rejects expressions in a publish
+step's `run`, `working-directory`, `with` or `env` that use a sandboxed
+step's outputs, since those are strings the sandbox chose. A step's
+`outcome` and `conclusion` are allowed: they are one of four fixed values,
+so the most the sandbox can do with them (by its exit status) is decide
+whether a publish step runs, which it can do anyway.
 
 **Status:** holds for files the sandbox's ids own (and settles
 [#1](https://github.com/cgwalters-forge/workflow-compiler/issues/1)). The
@@ -395,23 +396,31 @@ composite action is expanded into its steps at compile time, so each of
 them lands in the phase the composite was used in.
 
 **Status:** partial. Pinning holds, nothing runs as runner in the middle
-of `steps`, and the shim runs JavaScript actions there; the
+of `steps`, and the shim runs JavaScript and composite actions there; the
 [README](../README.md#actions-in-the-sandbox) lists the actions it can't
-run, which are compile errors. The fetch step checks each action's
-`action.yml` against the sha256 in `actions.lock.json`, so the metadata
-the compiler used is that commit's. A pin covers the action's own files,
-not a composite's nested `uses:`, a Docker image or what the action
-downloads, and GitHub resolves a SHA from anywhere in the repository's
-fork network
+run, which are compile errors. An action's own text (input defaults, entry
+points, composite steps, outputs) is untrusted, since it goes into the
+lock file and Actions evaluates it with the job's contexts: it is held to
+allowlists of names, paths, functions and credential-free contexts, and
+its env names never apply to the runner-side wrapper. The fetch step
+checks each action's `action.yml` against the sha256 in
+`actions.lock.json`, so the metadata the compiler used is that commit's. A
+pin covers the action's own files, not a composite's nested `uses:`, a
+Docker image or what the action downloads, and GitHub resolves a SHA from
+anywhere in the repository's fork network
 ([#30](https://github.com/cgwalters-forge/workflow-compiler/issues/30)).
 Post-steps of setup actions run as runner at the end of the job
 ([#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2)).
 
 **Proof:** `tests/reject/unpinned-action.ncl`,
-`tests/reject/credentialed-action-in-steps.ncl`; `workflows/actions-test.ncl`
-on hosted ubuntu-26.04, which runs DavidAnson/markdownlint-cli2-action
-and actions/setup-node (into the sandbox's tool cache, with its post
-step).
+`tests/reject/credentialed-action-in-steps.ncl`, and the `action-*` reject
+tests, each a hostile action fixture from `tests/actions/`: env names for
+the wrapper (`NODE_OPTIONS`), the caller's steps and env, `github.*`
+filters, a token oracle in `if:`, an expression in an entry point or
+`post-if`, an output name that isn't one; `workflows/actions-test.ncl`
+on hosted ubuntu-26.04, which runs DavidAnson/markdownlint-cli2-action,
+actions/setup-node (into the sandbox's tool cache, with its post step) and
+the composite crate-ci/typos, which must also fail on a misspelled file.
 
 ### R10. What the guarantee depends on
 

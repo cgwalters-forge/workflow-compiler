@@ -1,0 +1,37 @@
+# A composite action using what the compiler rewrites: its inputs (a
+# literal default with $ in it, a required one, defaults naming runner
+# paths, names one of which starts another), its own steps' outputs and
+# outcome, text around an expression, and runner contexts.
+name: composite-ok
+inputs:
+  greeting:
+    default: hello
+  who:
+    required: true
+  price:
+    default: costs $5, or $$1
+  ws:
+    default: ${{ github.workspace }}
+  here:
+    default: ${{ github.action_path }}
+  ver:
+    default: "1"
+  ver-file:
+    default: .version
+outputs:
+  message:
+    value: ${{ steps.say.outputs.message }}
+runs:
+  using: composite
+  steps:
+    - id: say
+      shell: bash
+      run: echo "message=${{ inputs.greeting }}, ${{ inputs.who }}" >> "$GITHUB_OUTPUT"
+    - shell: bash
+      if: steps.say.outcome == 'success' && runner.os == 'Linux'
+      run: |
+        echo "${{ steps.say.outputs.message }}" done
+        echo '${{ inputs.price }}' in "${{ runner.temp }}" for ${{ github.repository }}
+        echo "${{ inputs.ws }} ${{ inputs.here }} ${{ inputs.ver }} ${{ inputs.ver-file }}"
+      env:
+        MESSAGE: ${{ steps.say.outputs.message }}

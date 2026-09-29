@@ -1,0 +1,8 @@
+# A token oracle: which steps run tells the sandbox about the token.
+name: composite-if-token
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo a
+      if: startsWith(github.token, 'ghs_A')

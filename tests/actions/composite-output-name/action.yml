@@ -1,0 +1,9 @@
+name: composite-output-name
+outputs:
+  "x; touch pwned":
+    value: "1"
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: "true"

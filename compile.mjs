@@ -6,8 +6,10 @@
 //                             actions.lock.json
 //   node compile.mjs --check  fail if a lock file is stale or hand-edited,
 //                             if actions.lock.json doesn't match the
-//                             action.yml files it holds, or if a source in
-//                             tests/reject/ compiles
+//                             action.yml files it holds, if a source in
+//                             tests/reject/ compiles, or if one in
+//                             tests/accept/ doesn't compile to its
+//                             .expected.yml
 //
 // Uses `nickel` from PATH, or $NICKEL.
 //
@@ -27,6 +29,11 @@ import path from "node:path";
 const ROOT = import.meta.dirname;
 const SOURCES = "workflows";
 const REJECT = "tests/reject";
+// Sources that must compile, to what their .expected.yml next to them
+// says, which is how tests of the compiler's rewriting (composite actions
+// from tests/actions/, for one) check its output without making a
+// workflow of it.
+const ACCEPT = "tests/accept";
 const OUT = ".github/workflows";
 const ACTIONS_LOCK = "actions.lock.json";
 const NICKEL = process.env.NICKEL ?? "nickel";
@@ -102,10 +109,26 @@ function readLock() {
   return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
 }
 
-// Checks that every entry's sha256 and metadata come from its action.yml.
+// The action.yml of a fixture entry, from tests/actions/; null for an
+// entry that isn't a fixture, false for one whose fixture is gone.
+function fixtureYaml(uses) {
+  const m = USES_RE.exec(uses);
+  if (!m || m[1].split("/")[0] !== TEST_OWNER) return null;
+  const file = path.join(ROOT, TEST_ACTIONS, m[1].split("/")[1], m[2].replace(/^\//, ""), "action.yml");
+  return existsSync(file) ? readFileSync(file, "utf8") : false;
+}
+
+// Checks that every entry's sha256 and metadata come from its action.yml,
+// and that a fixture's is the one in tests/actions/.
 function checkLock(lock) {
   const problems = [];
   for (const [uses, entry] of Object.entries(lock)) {
+    const fixture = fixtureYaml(uses);
+    if (fixture === false) {
+      problems.push(`${ACTIONS_LOCK}: ${uses}: its fixture in tests/actions/ is gone; run node compile.mjs`);
+    } else if (fixture !== null && fixture !== entry.yaml) {
+      problems.push(`${ACTIONS_LOCK}: ${uses}: tests/actions/ changed since it was locked; run node compile.mjs`);
+    }
     if (sha256(entry.yaml) !== entry.sha256) problems.push(`${ACTIONS_LOCK}: ${uses}: sha256 doesn't match its action.yml`);
     else if (stableJSON(parseActionYaml(entry.yaml)) !== stableJSON(entry.metadata)) {
       problems.push(`${ACTIONS_LOCK}: ${uses}: metadata doesn't match its action.yml; run node compile.mjs`);
@@ -117,6 +140,22 @@ function checkLock(lock) {
 const check = process.argv.includes("--check");
 const problems = [];
 const lock = readLock();
+// Fixtures are relocked from tests/actions/ on every compile.
+if (!check) {
+  let changed = false;
+  for (const uses of Object.keys(lock)) {
+    const yaml = fixtureYaml(uses);
+    if (yaml === false) {
+      // Relocked below if a source still uses it, which then fails.
+      delete lock[uses];
+      changed = true;
+    } else if (yaml !== null && yaml !== lock[uses].yaml) {
+      lock[uses] = await fetchAction(uses);
+      changed = true;
+    }
+  }
+  if (changed) writeFileSync(path.join(ROOT, ACTIONS_LOCK), stableJSON(lock));
+}
 
 // Compiles SRC, adding the actions it needs to the lock unless checking.
 async function compile(src) {
@@ -145,6 +184,16 @@ for (const src of nclFiles(SOURCES)) {
   } else if (!existsSync(path.join(ROOT, lockFile)) || readFileSync(path.join(ROOT, lockFile), "utf8") !== text) {
     problems.push(`${lockFile} does not match ${src}; run node compile.mjs and commit the result`);
   }
+}
+
+for (const src of nclFiles(ACCEPT)) {
+  const expected = path.join(ACCEPT, `${path.basename(src, ".ncl")}.expected.yml`);
+  const r = await compile(src);
+  if (!r.ok) problems.push(`${src} does not compile:\n${r.stderr}`);
+  else if (!check) writeFileSync(path.join(ROOT, expected), r.stdout);
+  else if (!existsSync(path.join(ROOT, expected)) || readFileSync(path.join(ROOT, expected), "utf8") !== r.stdout) {
+    problems.push(`${src} does not compile to ${expected}; run node compile.mjs and review the difference`);
+  } else console.log(`ok: ${src} compiles to ${expected}`);
 }
 
 if (!check) {
