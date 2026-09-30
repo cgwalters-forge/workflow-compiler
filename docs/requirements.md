@@ -104,12 +104,12 @@ else. The lock file in `.github/workflows/` is a deterministic function of
 the reviewed source and of this repository's contracts and runtime scripts,
 which the lock file embeds; the stale-lock check fails `ci` on any
 difference. So reviewing the source is reviewing the job, and the source's
-schema has no way to say "run this later step as runner". The check itself
-runs from the pull request's own `ci.yml`, compiler (`src/`), `lib/` and
-`runtime/`, so those files are inside
-the boundary too: a pull request that changes them can make a stale lock
-file pass, and they need the same review as the lock files
-([#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26)).
+schema has no way to say "run this later step as runner". `ci` runs the
+check from the pull request's own tree, where a change to `ci.yml`,
+the compiler's `src/` or `lib/` could make a stale lock file pass; so the same
+checks also run from the base branch's code, in `trusted-check`, with the
+pull request only as data, and a change to the compiler itself needs a
+maintainer's fresh label (R14).
 
 The **uid boundary** is between the runner user and the sandbox user
 (`runner-sandbox`). It is the one that holds at run time against hostile
@@ -216,9 +216,8 @@ and jobs and workflows have only the keys gha.ncl's contracts let through,
 so a key GitHub adds later is refused until the compiler knows it. Any
 other file in `.github/workflows/` must be listed, with its reason, in
 `.github/uncompiled-workflows` (here, `ci.yml`), and every lock file needs
-a source. This proves the repository's own tree; that the tree `ci` runs
-the check from is trustworthy is
-[#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26).
+a source. `trusted-check` runs this from the base branch's code too
+(R14).
 
 **Proof:** the reject tests in `tests/reject/` (`shell-override`,
 `working-directory`, `job-container`, `job-defaults`, and the others),
@@ -492,10 +491,9 @@ there, the pull request's code may only be checked out and run inside the
 sandbox ([#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19)),
 and event text may only reach privileged steps as data (R12).
 
-**The repository requires `ci`**, including the stale-lock check, before
-anything merges, and its maintainers review changes to `ci.yml`,
-the compiler (`src/`), `lib/` and `runtime/` like lock files
-([#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26)).
+**The repository requires `ci` and `trusted-check`** before anything
+merges (R14), and its maintainers review changes to the compiler like
+lock files, which the `compiler-change` label records.
 
 **The privileged phase doesn't run code from an untrusted checkout.**
 `runner_steps` run as runner with sudo: a `run: make deps` there, on a
@@ -578,6 +576,63 @@ holds only for one that does.
 
 **Status:** not enforced
 ([#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20)).
+
+### R14. The lock files are checked by code the pull request can't change
+
+`ci` checks a pull request with the pull request's own `ci.yml`,
+compiler (`src/`), `lib/` and `runtime/`, which the pull request can change
+so that a lock file that doesn't match its source, or doesn't have the
+compiled shape, passes. So `trusted-check` runs the same checks with the
+default branch's code. It is a `pull_request_target` workflow, so its
+file and everything it runs come from the default branch (GitHub always
+takes that workflow from the default branch, whatever the pull request's
+base), with only `contents: read` and no secrets. The pull request's tree
+is data: the default branch's `wfc`, built from its checkout alone,
+writes each of its blobs as committed (`wfc extract-tree`), ignoring its
+`.gitattributes` (which `git archive` would apply, dropping or rewriting
+files), and refuses symlinks, submodules and `..` paths; nothing there is
+executed or built. That `wfc` then compiles the pull request's sources,
+compares the lock files and checks their shape (R1), including what the
+compiler's lints refuse in publish and sandboxed steps.
+
+It still compiles with the pull request's `lib/` and checks against its
+`runtime/`, `actions.lock.json` and uncompiled-workflows list: those are
+the compiler, and a pull request may change them. So any change to them,
+to `src/`, the crate's manifests and build configuration (`build.rs`,
+`.cargo/`, the toolchain file), `.gitattributes` or a workflow that
+isn't a lock file, compared with the default branch (so a stacked pull request's base
+branch doesn't hide one), passes only on the event of a maintainer
+applying the `compiler-change` label: a human other than the pull
+request's author (`cgwalters-bot`, which has admin here, and any `[bot]`
+account are refused), with the admin or maintain role, which the check
+looks up. Every other event checks again and fails, so a push after the label
+needs it applied anew; that includes labeling with another label, since
+a passing check on an unrelated event would stand for the head it ran
+on.
+
+**Status:** holds once these ruleset settings are in place, which only an
+administrator can make: `trusted-check` a required status check, pinned
+to the GitHub Actions app, with branches required to be up to date before
+merging, so what passed is what merges. Evaluating the pull request's
+nickel is still running its code, bounded by the job's timeout, in an
+interpreter whose only I/O is reading files: an `import` can name any
+file the job's user can read, and what it reads can show in the job's
+public log. The job has no secrets and checks out without persisting
+credentials, and confining the step to the extracted tree is
+[#57](https://github.com/cgwalters-forge/workflow-compiler/issues/57).
+
+**Proof:** since GitHub runs `pull_request_target` workflows only from
+the default branch, the workflow can't run before it is merged. Its steps
+were replayed on a devspace against test branches, as the event would run
+them: an honest change to a source passes; a hand-edited lock file fails
+at the compare; a change to the compiler fails at the label gate on a
+push, on another label, and when its author or a bot labels it, and
+passes on a maintainer's `compiler-change` labeling; a head with no
+history in common with the default branch fails at the gate rather than
+passing as unchanged.
+`tests/extract.rs` checks that `export-ignore`,
+`export-subst` and `ident` don't change what is extracted, and that a
+symlink is refused. Once merged, the same pull requests are the test.
 
 ## Non-goals
 
@@ -665,7 +720,7 @@ the roadmap in the [README](../README.md#status-and-roadmap):
 - [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21): nothing checks the repository settings (R10);
 - [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22): unrestricted network egress ([Non-goals](#non-goals));
 - [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25): expressions from events in privileged `run:` steps (R12) (fixed);
-- [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26): the stale-lock check runs the pull request's own compiler (review boundary, R10);
+- [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26): the stale-lock check runs the pull request's own compiler (review boundary, R10) (fixed, R14);
 - [#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27): local sockets and localhost services (R2, R3);
 - [#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28): the ephemeral-runner assumption (R5, R10);
 - [#29](https://github.com/cgwalters-forge/workflow-compiler/issues/29): explicit token permissions (R10);

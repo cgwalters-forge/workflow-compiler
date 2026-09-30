@@ -1,0 +1,129 @@
+# The stale-lock and shape checks, run from code the pull request can't
+# change (#26). ci.yml runs them too, but from the pull request's own
+# tree, where a change to the compiler, lib/ or ci.yml can make them pass
+# whatever the lock files say.
+#
+# This runs on pull_request_target, so the workflow and every script it
+# runs are the default branch's: GitHub takes the workflow from there
+# whatever the pull request's base, and checks out that branch's head. The
+# pull request's tree is only data: the default branch's wfc, built from
+# its checkout alone, writes its blobs into head/ exactly as committed (no
+# .gitattributes applied), and then checks head/. Nothing of the pull
+# request is executed or built, but evaluating its nickel can read any
+# file this job can (#57).
+#
+# A pull request that changes the compiler relative to the default branch
+# (lib/, runtime/, src/, the crate's manifests and build configuration,
+# actions.lock.json, .gitattributes, the uncompiled-workflows list, or a
+# workflow that isn't a lock file) passes only on the event of a maintainer, other than its
+# author, applying the `compiler-change` label after reviewing it. Any
+# other event checks it again and fails, so a push after the label needs
+# it applied anew. docs/requirements.md (R14) has the trust model.
+name: trusted-check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Paths whose change is a change of the compiler, reviewed by hand.
+      COMPILER_PATHS: lib runtime src build.rs Cargo.toml Cargo.lock rust-toolchain.toml rust-toolchain .cargo actions.lock.json .gitattributes .github/uncompiled-workflows
+      LABEL: compiler-change
+      # Who may vouch for a change of the compiler.
+      APPROVER_ROLES: admin maintain
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: base
+          fetch-depth: 0
+          persist-credentials: false
+
+      # By number, from this repository, so a fork's needs no access of
+      # its own.
+      - name: Fetch the pull request's head
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git -C base fetch -q --no-tags "$SERVER/$REPO" "+refs/pull/$PR/head:refs/remotes/pr/head"
+          test "$(git -C base rev-parse refs/remotes/pr/head)" = "$HEAD_SHA"
+
+      - name: Build wfc from the default branch
+        working-directory: base
+        run: cargo build --release --locked
+
+      - name: Extract its tree as data
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: base/target/release/wfc extract-tree base "$HEAD_SHA" head
+
+      - name: Changes to the compiler need a maintainer's fresh label
+        env:
+          ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          SENDER: ${{ github.event.sender.login }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Against the default branch's tip, which is what runs here, so
+          # that changes on a stacked pull request's base branch count too.
+          # Two trees, not the merge-base: a pull request on an older base
+          # would otherwise check its lock files with that base's compiler.
+          read -ra paths <<<"$COMPILER_PATHS"
+          # Captured first, so a failing diff (a missing commit, say)
+          # fails the step rather than looking like no change.
+          diff=$(git -C base diff --name-only HEAD "$HEAD_SHA" -- "${paths[@]}" \
+            ':(glob).github/workflows/*' ':(exclude,glob).github/workflows/*.lock.yml')
+          mapfile -t changed <<<"$diff"
+          [ -n "$diff" ] || changed=()
+          if [ "${#changed[@]}" -eq 0 ]; then
+            echo "The compiler is unchanged from the default branch."
+            exit 0
+          fi
+          echo "This pull request changes the compiler:"
+          printf '  %s\n' "${changed[@]}"
+          # Only the labeling itself counts: a label applied before the
+          # last push doesn't vouch for what was pushed after it.
+          if [ "$ACTION" != labeled ] || [ "$EVENT_LABEL" != "$LABEL" ]; then
+            echo "::error::the compiler changed; a maintainer other than its author must review it and then (re)apply the $LABEL label, after the last push"
+            exit 1
+          fi
+          # Bots can't vouch for a review: cgwalters-bot has admin here.
+          if [ "$SENDER" = cgwalters-bot ] || [[ "$SENDER" == *"[bot]" ]]; then
+            echo "::error::$SENDER is a bot; a human maintainer must review the compiler change"
+            exit 1
+          fi
+          if [ "$SENDER" = "$AUTHOR" ]; then
+            echo "::error::$SENDER labeled their own pull request; another maintainer must review the compiler change"
+            exit 1
+          fi
+          role=$(gh api "repos/$REPO/collaborators/$SENDER/permission" --jq .role_name)
+          read -ra roles <<<"$APPROVER_ROLES"
+          if [[ " ${roles[*]} " != *" $role "* ]]; then
+            echo "::error::$SENDER has the $role role; the $LABEL label counts only from ${APPROVER_ROLES// / or }"
+            exit 1
+          fi
+          echo "$SENDER ($role) labeled it $LABEL at this head."
+
+      # The pull request's uncompiled-workflows list: past the gate, it is
+      # the default branch's own or a change a maintainer approved.
+      - name: Lock files match their sources and have the compiled shape, by the default branch's wfc
+        run: base/target/release/wfc check --root head

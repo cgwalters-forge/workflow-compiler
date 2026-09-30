@@ -4,6 +4,7 @@
 //! `.github/workflows/`.
 
 pub mod actions;
+pub mod extract;
 pub mod nickel;
 pub mod repo;
 pub mod shape;

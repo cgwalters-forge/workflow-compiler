@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# extract-tree writes a pull request's tree through a directory fd.
+cap-std-ext = "5"
 clap = { version = "4", features = ["derive"] }
 # Outside nickel's 1.0 stability promise, so pinned exactly; bump it
 # deliberately and regenerate the lock files. 0.19.0 is the core of
