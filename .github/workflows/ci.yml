@@ -43,6 +43,9 @@ jobs:
           persist-credentials: false
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # `wfc check` (in cargo test) lints imported scripts with shellcheck
+      # only when it is installed; here it must be.
+      - run: shellcheck --version
       - run: cargo test --locked
       - name: Unit tests of the runtime scripts
         run: node --test 'tests/runtime/*.test.cjs'

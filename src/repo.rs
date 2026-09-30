@@ -23,6 +23,11 @@ impl Repo {
         Ok(Self { root })
     }
 
+    /// The root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// `rel`, relative to the root, as a path.
     pub fn path(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
