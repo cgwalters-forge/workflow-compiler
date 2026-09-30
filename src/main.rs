@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use workflow_compiler::{Mode, run};
+use workflow_compiler::{Mode, extract, run};
 
 #[derive(Parser)]
 #[command(
@@ -29,6 +29,15 @@ enum Command {
     /// .github/workflows/ is neither a lock file with the compiled shape
     /// nor listed in .github/uncompiled-workflows.
     Check(Repo),
+    /// Write the tree of COMMIT into DEST, which must not exist, as plain
+    /// files: every blob exactly as committed, ignoring .gitattributes.
+    /// Symlinks, submodules and `.` or `..` paths are refused.
+    ExtractTree {
+        /// A directory in the repository.
+        git_dir: PathBuf,
+        commit: String,
+        dest: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -42,6 +51,15 @@ fn main_inner() -> Result<bool> {
     let (repo, mode) = match Cli::parse().command {
         Command::Compile(repo) => (repo, Mode::Compile),
         Command::Check(repo) => (repo, Mode::Check),
+        Command::ExtractTree {
+            git_dir,
+            commit,
+            dest,
+        } => {
+            let n = extract::extract_tree(&git_dir, &commit, &dest)?;
+            eprintln!("extracted {n} files of {commit}");
+            return Ok(true);
+        }
     };
     let problems = run(&repo.root, mode)?;
     for p in &problems {

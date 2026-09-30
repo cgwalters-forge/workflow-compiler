@@ -219,10 +219,16 @@ cargo test            # wfc's own tests, and `check` of this repository
 must have a source and the compiled shape (`src/shape.rs`: the generated
 enter and seal steps, byte for byte, and nothing between them that
 leaves the wrapper), and anything else must be listed, with its reason,
-in `.github/uncompiled-workflows`.
+in `.github/uncompiled-workflows`. `trusted-check.yml` runs the same
+checks on every pull request with the base branch's code, the pull
+request's tree only as data, and needs a maintainer's `compiler-change`
+label on pull requests that change the compiler itself (R14).
 
 `compile` also fetches new actions' metadata from GitHub; `check` never
-uses the network.
+uses the network. `trusted-check` compiles a pull request's sources (R14
+in [docs/requirements.md](docs/requirements.md)), and nickel resolves
+their imports against any path the job can read; confining that step is
+[#57](https://github.com/cgwalters-forge/workflow-compiler/issues/57).
 
 `nickel-lang-core` is outside nickel's 1.0 stability promise, so
 `Cargo.toml` pins it exactly; a bump can change the lock files, so it
@@ -272,7 +278,6 @@ the task compiler that will produce this compiler's input):
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19) `runner_steps` that execute a pull request's checkout (P1)
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20) caches saved from sandbox output and restored in `runner_steps` (P1)
 - [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25) expressions from issues, comments and pull requests in privileged `run:` steps (P1)
-- [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26) the stale-lock check runs the pull request's own compiler (P1)
 - [#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27) local sockets and localhost services reachable from the sandbox (P1)
 - [#14](https://github.com/cgwalters-forge/workflow-compiler/issues/14) prompts from a trusted ref for PR-triggered agents (P2)
 - [#2](https://github.com/cgwalters-forge/workflow-compiler/issues/2) post-steps of `runner_steps` actions (P2)
