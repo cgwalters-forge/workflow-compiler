@@ -7,9 +7,10 @@ pub mod actions;
 pub mod extract;
 pub mod nickel;
 pub mod repo;
+pub mod scripts;
 pub mod shape;
 
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -126,34 +127,41 @@ pub fn run(root: &Path, mode: Mode) -> Result<Vec<String>> {
 fn check(root: &Repo) -> Result<Vec<String>> {
     let lock = actions::read_lock(root)?;
     let mut problems = actions::check_lock(root, &lock);
+    // The files the sources load, whose scripts are linted below; a
+    // source that fails to compile is reported instead.
+    let mut loaded = BTreeSet::new();
     let sources = root.list(SOURCES_DIR, ".ncl")?;
     for source in &sources {
         let path = lock_path(source);
-        match nickel::export_yaml(root, source) {
+        match nickel::export(root, source) {
             Err(e) => problems.push(format!("{e:#}")),
-            Ok(yaml) => {
+            Ok(export) => {
                 let committed = root.read(&path)?;
                 problems.extend(stale(
                     &path,
                     source,
                     committed.as_deref(),
-                    &(header(source) + &yaml),
+                    &(header(source) + &export.yaml),
                 ));
+                loaded.extend(export.files);
             }
         }
     }
     let accepts = root.list(ACCEPT_DIR, ".ncl")?;
     for source in &accepts {
         let path = expected_path(source);
-        match nickel::export_yaml(root, source) {
+        match nickel::export(root, source) {
             Err(e) => problems.push(format!("{e:#}")),
-            Ok(yaml) => {
+            Ok(export) => {
                 let committed = root.read(&path)?;
-                problems.extend(stale(&path, source, committed.as_deref(), &yaml));
+                problems.extend(stale(&path, source, committed.as_deref(), &export.yaml));
+                loaded.extend(export.files);
             }
         }
     }
     problems.extend(shape::check_tree(root)?);
+    let loaded: Vec<String> = loaded.into_iter().collect();
+    problems.extend(scripts::check(root, &loaded)?);
     let rejects = root.list(REJECT_DIR, ".ncl")?;
     for source in &rejects {
         let text = root.read(source)?.unwrap_or_default();
@@ -174,9 +182,13 @@ fn check(root: &Repo) -> Result<Vec<String>> {
         }
     }
     eprintln!(
-        "checked {} lock files, {} accept tests, {} reject tests and {} locked actions",
+        "checked {} lock files, {} accept tests, {} scripts, {} reject tests and {} locked actions",
         sources.len(),
         accepts.len(),
+        loaded
+            .iter()
+            .filter(|s| s.ends_with(scripts::SCRIPT_SUFFIX))
+            .count(),
         rejects.len(),
         lock.len()
     );

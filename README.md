@@ -228,6 +228,14 @@ checks on every pull request with the base branch's code, the pull
 request's tree only as data, and needs a maintainer's `compiler-change`
 label on pull requests that change the compiler itself (R14).
 
+A `run` script of more than 10 lines doesn't go inline in a source: it
+goes in a file of its own, imported as text (`run = import
+"sandbox-test/read-shares.sh" as 'Text`), and the compile refuses a
+longer inline one. `check` lints every `.sh` file a source imports: it
+must pass `bash -n` and, when it is installed (as on the hosted runners
+ci uses), shellcheck, and must hold no `${{ }}` expression, which Actions
+would expand into the script's code; values go in the step's `env:`.
+
 `compile` also fetches new actions' metadata from GitHub; `check` never
 uses the network. `trusted-check` compiles a pull request's sources (R14
 in [docs/requirements.md](docs/requirements.md)), and nickel resolves
