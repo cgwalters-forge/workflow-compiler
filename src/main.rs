@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use workflow_compiler::{Mode, extract, run};
+use workflow_compiler::{Mode, extract, run, shape};
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +46,11 @@ struct Repo {
     /// The repository's root.
     #[arg(long, default_value = ".")]
     root: PathBuf,
+    /// The compiler's runtime/ directory, relative to the root, that the
+    /// lock files embed: a checkout's, in a repository that imports the
+    /// library from a checkout of workflow-compiler (#8).
+    #[arg(long, default_value = shape::RUNTIME_DIR)]
+    runtime: String,
 }
 
 fn main_inner() -> Result<bool> {
@@ -62,7 +67,7 @@ fn main_inner() -> Result<bool> {
             return Ok(true);
         }
     };
-    let problems = run(&repo.root, mode)?;
+    let problems = run(&repo.root, &repo.runtime, mode)?;
     for p in &problems {
         eprintln!("error: {p}");
     }

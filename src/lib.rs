@@ -117,15 +117,19 @@ fn stale(path: &str, source: &str, committed: Option<&str>, compiled: &str) -> O
 
 /// Compiles or checks the repository at `root`, returning the problems
 /// found. Only fetching new actions' metadata happens outside it.
-pub fn run(root: &Path, mode: Mode) -> Result<Vec<String>> {
+/// `runtime` is the directory, relative to `root`, of the compiler
+/// runtime the lock files embed: `runtime` in this repository, and the
+/// `runtime` of a checkout of it in a repository that imports its library
+/// from there.
+pub fn run(root: &Path, runtime: &str, mode: Mode) -> Result<Vec<String>> {
     let repo = Repo::open(root)?;
     match mode {
-        Mode::Check => check(&repo),
+        Mode::Check => check(&repo, runtime),
         Mode::Compile => compile(&repo),
     }
 }
 
-fn check(root: &Repo) -> Result<Vec<String>> {
+fn check(root: &Repo, runtime: &str) -> Result<Vec<String>> {
     let lock = actions::read_lock(root)?;
     let mut problems = actions::check_lock(root, &lock);
     // The files the sources load, whose scripts are linted below; a
@@ -160,7 +164,7 @@ fn check(root: &Repo) -> Result<Vec<String>> {
             }
         }
     }
-    problems.extend(shape::check_tree(root)?);
+    problems.extend(shape::check_tree(root, runtime)?);
     problems.extend(pins::check(root)?);
     let loaded: Vec<String> = loaded.into_iter().collect();
     problems.extend(scripts::check(root, &loaded)?);

@@ -7,14 +7,18 @@ use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 use workflow_compiler::repo::Repo;
-use workflow_compiler::shape::{Runtime, check_tree, check_workflow, read_runtime};
+use workflow_compiler::shape::{RUNTIME_DIR, Runtime, check_tree, check_workflow, read_runtime};
 
 const EXEC: &str = "/usr/local/bin/runner-sandbox-exec";
 const SEAL: &str = "steps.runner-sandbox-seal.outcome == 'success'";
 const UPLOAD: &str = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
-    read_runtime(&Repo::open(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap()
+    read_runtime(
+        &Repo::open(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap(),
+        RUNTIME_DIR,
+    )
+    .unwrap()
 });
 
 fn rt(name: &str) -> &'static str {
@@ -487,7 +491,9 @@ fn every_workflow_file_is_compiled_or_a_listed_exception() {
         ".github/uncompiled-workflows",
         "# comment\nci.yml  # our own checks\nnoreason.yml\ngone.yml  # was here\n",
     );
-    let found = check_tree(&Repo::open(root).unwrap()).unwrap().join("\n");
+    let found = check_tree(&Repo::open(root).unwrap(), RUNTIME_DIR)
+        .unwrap()
+        .join("\n");
     for want in [
         "extra.YML isn't compiled",
         "orphan.lock.yml has no source",
