@@ -224,7 +224,9 @@ cargo test            # wfc's own tests, and `check` of this repository
 `check` also checks every workflow in `.github/workflows/`: a lock file
 must have a source and the compiled shape (`src/shape.rs`: the generated
 enter and seal steps, byte for byte, and nothing between them that
-leaves the wrapper), and anything else must be listed, with its reason,
+leaves the wrapper; the enter step is compared with `runtime/`, or with
+`--runtime DIR` in a repository that imports the library from a checkout
+of this one), and anything else must be listed, with its reason,
 in `.github/uncompiled-workflows`. `trusted-check.yml` runs the same
 checks on every pull request with the base branch's code, the pull
 request's tree only as data, and needs a maintainer's `compiler-change`

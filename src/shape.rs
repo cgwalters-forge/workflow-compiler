@@ -24,7 +24,9 @@ use crate::{LOCKS_DIR, SOURCES_DIR, UNCOMPILED, nickel};
 /// name.
 pub type Runtime = BTreeMap<String, String>;
 
-const RUNTIME_DIR: &str = "runtime";
+/// Where a repository keeps the compiler's runtime scripts, by default:
+/// this repository's own.
+pub const RUNTIME_DIR: &str = "runtime";
 const EXEC: &str = "/usr/local/bin/runner-sandbox-exec";
 const SEAL_ID: &str = "runner-sandbox-seal";
 const SEAL_CONDITION: &str = "steps.runner-sandbox-seal.outcome == 'success'";
@@ -620,11 +622,11 @@ fn files_in(root: &Repo, rel: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The runtime scripts of the repository at `root`.
-pub fn read_runtime(root: &Repo) -> Result<Runtime> {
+/// The runtime scripts in `dir` of the repository at `root`.
+pub fn read_runtime(root: &Repo, dir: &str) -> Result<Runtime> {
     let mut runtime = Runtime::new();
-    for name in files_in(root, RUNTIME_DIR)? {
-        let rel = format!("{RUNTIME_DIR}/{name}");
+    for name in files_in(root, dir)? {
+        let rel = format!("{dir}/{name}");
         // Only files are scripts; a directory or symlink there is skipped.
         if root.is_file(&rel)?
             && let Some(text) = root.read(&rel)?
@@ -640,7 +642,7 @@ pub fn read_runtime(root: &Repo) -> Result<Runtime> {
 /// [`UNCOMPILED`], one name per line with its reason after `#`: each runs
 /// with none of the compiler's guarantees, so each is a reviewed
 /// exception. Returns the problems.
-pub fn check_tree(root: &Repo) -> Result<Vec<String>> {
+pub fn check_tree(root: &Repo, runtime_dir: &str) -> Result<Vec<String>> {
     let mut found = Vec::new();
     let list_name = Path::new(UNCOMPILED)
         .file_name()
@@ -654,7 +656,7 @@ pub fn check_tree(root: &Repo) -> Result<Vec<String>> {
             Value::from(line)
         ));
     }
-    let runtime = read_runtime(root)?;
+    let runtime = read_runtime(root, runtime_dir)?;
     let files = files_in(root, LOCKS_DIR)?;
     for file in &files {
         let rel = format!("{LOCKS_DIR}/{file}");
@@ -668,6 +670,12 @@ pub fn check_tree(root: &Repo) -> Result<Vec<String>> {
         };
         if root.read(&format!("{SOURCES_DIR}/{stem}.ncl"))?.is_none() {
             found.push(format!("{rel} has no source in {SOURCES_DIR}/"));
+            continue;
+        }
+        if runtime.is_empty() {
+            found.push(format!(
+                "{rel}: no runtime scripts in {runtime_dir}/ to check its enter step against; pass --runtime with the runtime/ directory of the compiler the sources import"
+            ));
             continue;
         }
         let text = root
