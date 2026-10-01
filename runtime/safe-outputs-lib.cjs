@@ -30,8 +30,14 @@ const SECRET_PATTERNS = [
 // field is refused rather than trimmed.
 const FIELDS = {
   add_comment: { required: ["body"], optional: ["item_number", "repo"] },
+  create_pull_request: { required: ["title", "body", "patch"], optional: ["repo"] },
   noop: { required: ["message"], optional: [] },
 };
+
+// Paths no pull request may touch, whatever the allowlist says: the
+// repository's workflows and actions (they'd run with its secrets), and
+// git's own files.
+const DENIED_PATHS = [/^\.github\//, /(^|\/)\.git(\/|$)/, /(^|\/)\.gitmodules$/];
 
 // gh-aw's sanitize_content, the parts that matter for text posted to
 // GitHub: no @mentions that would notify anyone, no hidden HTML comments
@@ -43,6 +49,72 @@ function sanitize(text) {
     .replace(/<!--[\s\S]*?(-->|$)/g, "")
     .replace(/(^|[^\w`])@([A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\/[A-Za-z0-9._-]+)?)/g, "$1`@$2`")
     .replace(/^(\s*)::/gm, "$1: :");
+}
+
+// A glob as a regex: `**` matches across directories, `*` and `?` within one.
+function globRegex(glob) {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      re += glob[i + 2] === "/" ? "(?:.*/)?" : ".*";
+      i += glob[i + 2] === "/" ? 2 : 1;
+    } else if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`);
+}
+
+// Why PATH may not be changed, or null if it may.
+function pathProblem(p, allowed) {
+  if (p === "" || p.startsWith("/") || p.split("/").some((c) => c === "" || c === "." || c === "..")) {
+    return `path ${JSON.stringify(p)} is not a plain relative path`;
+  }
+  if (DENIED_PATHS.some((re) => re.test(p))) return `path ${JSON.stringify(p)} may never be changed`;
+  if (!allowed.some((g) => globRegex(g).test(p))) return `path ${JSON.stringify(p)} is outside the allowed paths`;
+  return null;
+}
+
+// Unquotes a path from a git patch header (git quotes unusual names).
+function headerPath(s) {
+  if (s.startsWith('"')) throw new Error("quoted path names aren't allowed");
+  return s;
+}
+
+// Checks PATCH, a `git diff` of text files, against CFG (the
+// create_pull_request config). Returns the paths it changes, or throws
+// with the reason it's refused.
+function checkPatch(patch, cfg) {
+  if (Buffer.byteLength(patch) > cfg.max_patch_bytes) throw new Error(`patch is over ${cfg.max_patch_bytes} bytes`);
+  const paths = new Set();
+  let files = 0;
+  for (const line of patch.split("\n")) {
+    let m;
+    if ((m = /^diff --git a\/(.+) b\/(.+)$/.exec(line))) {
+      files++;
+      paths.add(headerPath(m[1]));
+      paths.add(headerPath(m[2]));
+    } else if ((m = /^(?:---|\+\+\+) (?:[ab]\/(.+)|\/dev\/null)$/.exec(line))) {
+      if (m[1] !== undefined) paths.add(headerPath(m[1]));
+    } else if ((m = /^(?:rename|copy) (?:from|to) (.+)$/.exec(line))) {
+      paths.add(headerPath(m[1]));
+    } else if (/^(?:new file |deleted file |old |new )?mode (\d+)$/.exec(line)) {
+      const mode = line.split(" ").at(-1);
+      if (mode !== "100644" && mode !== "100755") throw new Error(`file mode ${mode} (a symlink or submodule) isn't allowed`);
+    } else if (/^(?:GIT binary patch|Binary files )/.test(line)) {
+      throw new Error("binary patches aren't allowed");
+    } else if (/^(?:---|\+\+\+) /.test(line) && files === 0) {
+      throw new Error("not a git diff");
+    }
+  }
+  if (files === 0) throw new Error("not a git diff (no `diff --git` header)");
+  if (files > cfg.max_files) throw new Error(`patch changes ${files} files, over ${cfg.max_files}`);
+  for (const p of paths) {
+    const why = pathProblem(p, cfg.allowed_paths);
+    if (why) throw new Error(why);
+  }
+  return [...paths].sort();
 }
 
 // Why proposal P is refused under CONFIG, or null. Doesn't count caps.
@@ -65,6 +137,14 @@ function checkProposal(p, config) {
       return `target ${JSON.stringify(target)} is not in the allowed targets [${cfg.targets.join(", ")}]`;
     }
     if (Buffer.byteLength(p.body) > cfg.max_body_bytes) return `body is over ${cfg.max_body_bytes} bytes`;
+  } else if (p.type === "create_pull_request") {
+    if (Buffer.byteLength(p.title) > 256) return "title is over 256 bytes";
+    if (Buffer.byteLength(p.body) > cfg.max_body_bytes) return `body is over ${cfg.max_body_bytes} bytes`;
+    try {
+      checkPatch(p.patch, cfg);
+    } catch (e) {
+      return e.message;
+    }
   } else if (Buffer.byteLength(p.message) > 1000) {
     return "message is over 1000 bytes";
   }
@@ -77,6 +157,8 @@ function normalize(p, config) {
   switch (p.type) {
     case "add_comment":
       return { type: p.type, item_number: p.item_number ?? config.types.add_comment.targets[0], body: sanitize(p.body) };
+    case "create_pull_request":
+      return { type: p.type, title: sanitize(p.title).replace(/\n/g, " "), body: sanitize(p.body), patch: p.patch };
     default:
       return { type: p.type, message: sanitize(p.message) };
   }
@@ -119,4 +201,4 @@ function parseLines(text) {
     });
 }
 
-module.exports = { sanitize, checkProposal, sortProposals, parseLines, normalize };
+module.exports = { sanitize, globRegex, pathProblem, checkPatch, checkProposal, sortProposals, parseLines, normalize };

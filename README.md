@@ -219,7 +219,13 @@ them for secrets (`runtime/safe-outputs-validate.cjs`). Then its publish
 phase checks what the sandbox accepted again, with the same code, and
 sanitizes its text again (mentions, HTML comments, workflow commands)
 before it writes anything (`runtime/safe-outputs-apply.cjs`). The types
-are `add_comment`, on the issues the source lists, and `noop`.
+are `add_comment`, on the issues the source lists, `noop`, and
+`create_pull_request`: a `git diff` of text files under the source's
+`allowed_paths` (never `.github/`, `.git` or `.gitmodules`), within a size
+and file-count cap, which the publish phase applies with git to a fresh
+fetch of `base` (no hooks), checks again as git sees it, commits, pushes
+as a new branch and opens as a draft pull request. The repository must
+let Actions create pull requests.
 
 `agent_run` is a compiler macro rather than a composite action because a
 composite action runs as `runner` and can't constrain the job around it
