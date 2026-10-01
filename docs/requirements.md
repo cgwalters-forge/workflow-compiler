@@ -747,11 +747,14 @@ write any `runner_steps`, run any setup action, and give `publish_steps`
 any token. The compiler makes the safe structure the only one a later step
 can have; it doesn't decide what the privileged phases may do.
 
-**Confidentiality of what the sandbox can read.** The sandbox has the
-checkout and the shares, and network access, so it can send them anywhere.
-For a public repository that is fine; for private code it needs an egress
-policy ([#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22)),
-which the uid boundary doesn't provide.
+**Confidentiality of what the sandbox can read, against allowed hosts.**
+The sandbox has the checkout and the shares. Its egress goes only to the
+hosts `sandbox.network.allow` lists, through a proxy that sees host names
+and not requests ([#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22),
+README "Network egress"), so what an allowed host accepts as an upload,
+such as a push to the attacker's own repository on an allowed forge, is
+still a way out. An L7 policy on methods and paths would close it
+([tracker#81](https://github.com/cgwalters-forge/tracker/issues/81)).
 
 **Availability.** A sandboxed step can use all of the machine's CPU,
 memory and disk until its `timeout-minutes`, or the job's (six hours by
@@ -820,7 +823,7 @@ the roadmap in the [README](../README.md#status-and-roadmap):
 - [#19](https://github.com/cgwalters-forge/workflow-compiler/issues/19): `runner_steps` that execute a pull request's checkout (R10);
 - [#20](https://github.com/cgwalters-forge/workflow-compiler/issues/20): caches from the sandbox or untrusted runs restored as runner (R13);
 - [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21): nothing checks the repository settings (R10);
-- [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22): unrestricted network egress ([Non-goals](#non-goals));
+- [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22): unrestricted network egress ([Non-goals](#non-goals)) (fixed for hosts; methods and paths are tracker#81);
 - [#25](https://github.com/cgwalters-forge/workflow-compiler/issues/25): expressions from events in privileged `run:` steps (R12) (fixed);
 - [#26](https://github.com/cgwalters-forge/workflow-compiler/issues/26): the stale-lock check runs the pull request's own compiler (review boundary, R10) (fixed, R14);
 - [#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27): local sockets and localhost services (R2, R3);

@@ -317,6 +317,33 @@ let PublishStep = fun publish_ids => std.contract.Sequence [
   NoUntrustedTextInScript true,
 ] in
 
+# Where the sandbox may connect (runtime/egress-proxy.cjs). By default
+# nowhere: its packets go only to this host, where the proxy listens, and
+# the proxy goes on to the hosts in `allow` alone, on ports 80 and 443.
+# The privileged phases' network is left as it is.
+let NETWORK_PATTERN = "^(\\*\\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$" in
+let Network =
+  std.contract.Sequence [
+    {
+      # Host names (`crates.io`, that host only) or `*.` and a host name
+      # (`*.githubusercontent.com`, its subdomains only); no IP literals or
+      # ports.
+      allow
+        | Array (
+          validator
+            (fun s => std.string.is_match NETWORK_PATTERN s)
+            (fun s => "sandbox.network.allow entry `%{s}` must be a lowercase host name, or `*.` and one, without an IP address, port or scheme")
+        )
+        | default = [],
+      # No egress restriction at all, as before #22.
+      unrestricted | Bool | default = false,
+    },
+    validator
+      (fun n => !(n.unrestricted && n.allow != []))
+      (fun _n => "sandbox.network: `allow` and `unrestricted = true` together make no sense; drop one"),
+  ]
+in
+
 let Sandbox = {
   # Never the runner (whose tokens the sandbox must not reach) nor root.
   user | String
@@ -326,6 +353,7 @@ let Sandbox = {
   # Take root away from the runner user too, once the sandbox is entered;
   # its only sudo rule left is the wrapper.
   lock_runner_sudo | Bool | default = true,
+  network | Network | default = {},
 } in
 
 # A relative path in the workspace, without `.` or `..` components.
@@ -386,6 +414,7 @@ let install_step = fun sandbox job_handoff =>
   let config = {
     user = sandbox.user,
     lockRunnerSudo = sandbox.lock_runner_sudo,
+    network = { allow = sandbox.network.allow, unrestricted = sandbox.network.unrestricted },
     handoff = { workspace = std.string.from_enum job_handoff.workspace, include = job_handoff.include },
     # Expanded by Actions when the step runs.
     workspace = "${{ github.workspace }}",
@@ -395,13 +424,14 @@ let install_step = fun sandbox job_handoff =>
     name = "Enter the sandbox (generated)",
     # sudo resets the environment; the runner's NOPASSWD: ALL rule allows
     # keeping these.
-    shell = "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}",
+    shell = "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS,RUNNER_SANDBOX_EGRESS_JS node {0}",
     env = {
       RUNNER_SANDBOX_EXEC_JS = import "../runtime/exec.cjs" as 'Text,
       RUNNER_SANDBOX_RUN_JS = import "../runtime/run.cjs" as 'Text,
       RUNNER_SANDBOX_HANDOFF_JS = import "../runtime/handoff.cjs" as 'Text,
       RUNNER_SANDBOX_FILECMD_JS = import "../runtime/filecmd.cjs" as 'Text,
       RUNNER_SANDBOX_LAUNCH_JS = import "../runtime/launch.cjs" as 'Text,
+      RUNNER_SANDBOX_EGRESS_JS = import "../runtime/egress-proxy.cjs" as 'Text,
     },
     run = "const CONFIG = %{std.serialize 'Json config};\n" ++ (import "../runtime/install.cjs" as 'Text),
   }

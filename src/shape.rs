@@ -37,6 +37,7 @@ const ENTER_ENV: &[(&str, &str)] = &[
     ("RUNNER_SANDBOX_HANDOFF_JS", "handoff.cjs"),
     ("RUNNER_SANDBOX_FILECMD_JS", "filecmd.cjs"),
     ("RUNNER_SANDBOX_LAUNCH_JS", "launch.cjs"),
+    ("RUNNER_SANDBOX_EGRESS_JS", "egress-proxy.cjs"),
 ];
 /// The keys gha.ncl's Workflow and Job contracts let through to the output.
 const WORKFLOW_KEYS: &[&str] = &[
@@ -90,7 +91,7 @@ const PUBLISH_STEP_KEYS: &[&str] = &[
     "continue-on-error",
     "timeout-minutes",
 ];
-const CONFIG_KEYS: &[&str] = &["user", "lockRunnerSudo", "handoff", "workspace"];
+const CONFIG_KEYS: &[&str] = &["user", "lockRunnerSudo", "handoff", "workspace", "network"];
 /// Never the sandbox user.
 const NOT_SANDBOX_USERS: &[&str] = &["root", "runner"];
 const HANDOFF_MODES: &[&str] = &["tracked", "all", "none"];
@@ -158,6 +159,11 @@ static WRAPPER_ENV: LazyLock<Regex> =
     LazyLock::new(|| re(r"^RUNNER_SANDBOX_(ENV|ENV_NAMES|VAR_[0-9]+|ANNOTATIONS)$"));
 /// As USER_RE in lib/gha.ncl.
 static USER: LazyLock<Regex> = LazyLock::new(|| re(r"^[a-z_][a-z0-9_-]{0,30}$"));
+/// As NETWORK_PATTERN in lib/gha.ncl and PATTERN_RE in
+/// runtime/egress-proxy.cjs: a `sandbox.network.allow` entry.
+static NETWORK_ALLOW: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$")
+});
 static WORKSPACE_PATH: LazyLock<Regex> = LazyLock::new(|| re(r"^[^/]+(/[^/]+)*$"));
 static QUOTED: LazyLock<Regex> = LazyLock::new(|| re(r"'([^']|'')*'"));
 static AFTER_SEAL_WRAPPED: LazyLock<Regex> = LazyLock::new(|| {
@@ -271,7 +277,32 @@ fn config_problems(config: &Value, has_publish: bool) -> Vec<String> {
     if !handoff_ok {
         problems.push(format!("has the hand-off {}", json(handoff)));
     }
+    if !network_ok(config.get("network")) {
+        problems.push(format!(
+            "has the network policy {}",
+            json(config.get("network"))
+        ));
+    }
     problems
+}
+
+/// Whether `network` is the policy gha.ncl's Network contract allows:
+/// host name patterns, or no restriction with no patterns.
+fn network_ok(network: Option<&Value>) -> bool {
+    let Some(n) = network.filter(|n| has_keys(n, &["allow", "unrestricted"])) else {
+        return false;
+    };
+    let Some(allow) = n["allow"].as_array() else {
+        return false;
+    };
+    let patterns_ok = allow
+        .iter()
+        .all(|p| p.as_str().is_some_and(|p| NETWORK_ALLOW.is_match(p)));
+    match n["unrestricted"].as_bool() {
+        Some(false) => patterns_ok,
+        Some(true) => allow.is_empty(),
+        None => false,
+    }
 }
 
 /// The CONFIG of `run` if it is `const CONFIG = <JSON object>;\n`

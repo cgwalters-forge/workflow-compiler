@@ -95,6 +95,45 @@ a lint against mistakes, not a boundary: a value a runner step put in
 boundary is the uid: the sandbox can't read the runner's processes, files
 or tokens, whatever the workflow text says.
 
+## Network egress
+
+By default the sandbox reaches no host on the network. The enter step
+starts an HTTP proxy (`runtime/egress-proxy.cjs`) as a systemd unit with a
+dynamic user, and adds nftables rules matching the sandbox user's uid and
+its subordinate uids: their packets may go to this host's own addresses,
+where the proxy listens, never to port 53, and nowhere else. Sandboxed
+steps get the proxy in `https_proxy` and its spellings, and the proxy
+tunnels or forwards only to the hosts a job lists, on ports 80 and 443:
+
+```nickel
+sandbox.network.allow = ["crates.io", "static.crates.io", "*.githubusercontent.com"],
+```
+
+An entry is a host name, or `*.` and a host name for its subdomains; the
+contract and `wfc check` refuse IP literals, ports, schemes and wildcards
+over a top-level domain. The proxy resolves names itself and refuses ones
+that resolve to loopback or link-local addresses (the cloud metadata
+service). The sandbox's own name resolution is closed too: port 53 is
+rejected, and systemd-resolved's D-Bus and varlink interfaces are denied
+to the sandbox user, so a name can't carry data to an outside DNS server.
+`sandbox.network.unrestricted = true` restores open egress. `runner_steps`
+and `publish_steps` keep the runner's network as it was.
+
+What this doesn't cover:
+
+- Writes to an allowed host. A domain allowlist can't tell an upload to
+  the attacker's account on `github.com` from a clone; with no TLS
+  interception, the proxy sees only the host name. Closing that needs an
+  L7 proxy that allows only listed methods and paths
+  ([tracker#81](https://github.com/cgwalters-forge/tracker/issues/81)).
+- Domain fronting through a CDN that serves an allowed name, for the same
+  reason.
+- Services on this host: loopback stays open, so the sandbox can reach
+  whatever listens there ([#27](https://github.com/cgwalters-forge/workflow-compiler/issues/27)).
+- Tools that ignore `https_proxy` fail rather than leak, as do rootless
+  containers, whose network namespace can't reach the proxy at 127.0.0.1
+  unless they share the host's (`--network=host`).
+
 ## Actions in the sandbox
 
 A `uses:` step in `steps` runs the action as the sandbox user, not as
@@ -373,7 +412,6 @@ the task compiler that will produce this compiler's input):
 - [#10](https://github.com/cgwalters-forge/workflow-compiler/issues/10) blocking the cloud metadata service for the sandbox (P2)
 - [#18](https://github.com/cgwalters-forge/workflow-compiler/issues/18) a size cap on staged outputs (P2)
 - [#21](https://github.com/cgwalters-forge/workflow-compiler/issues/21) checking the repository settings the guarantee depends on (P2)
-- [#22](https://github.com/cgwalters-forge/workflow-compiler/issues/22) restricting the sandbox's network egress (P2)
 - [#28](https://github.com/cgwalters-forge/workflow-compiler/issues/28) the enter step assumes an ephemeral runner (P2)
 - [#29](https://github.com/cgwalters-forge/workflow-compiler/issues/29) explicit token permissions (P2)
 - [#30](https://github.com/cgwalters-forge/workflow-compiler/issues/30) what pinned actions pull in (P2)

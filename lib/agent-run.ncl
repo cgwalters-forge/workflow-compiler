@@ -92,10 +92,19 @@ let AgentRun = {
   fake_script | Array { _ : Dyn } | default = [],
   # Minutes the agent may run, and its spend cap in AIC (1 AIC = $0.01).
   agent_timeout_minutes | Number | default = 10,
+  # Hosts the agent may reach (gha.ncl's sandbox.network.allow), on top of
+  # its inference endpoint's. None by default: a prompt-injected agent
+  # could send anything it reads to anywhere it can reach.
+  network_allow | Array String | default = [],
   budget_aic | Number | default = 500,
   "runs-on" | String | default = gha.default_runner,
   "timeout-minutes" | Number | default = 45,
 } in
+
+# Hosts every agent of `agent` needs: its inference endpoint. The
+# scripted agent needs none; praxis's host goes here with real inference
+# (#36), taken from the source's praxis URL.
+let inference_hosts = fun _agent => [] in
 
 fun args =>
   let a = args | AgentRun in
@@ -105,6 +114,7 @@ fun args =>
     # Agents work with git: the checkout's history comes along (checkout
     # persists no credentials, and the hand-off checks .git/config).
     handoff.include = [".git"],
+    sandbox.network.allow = inference_hosts a.agent @ a.network_allow,
     runner_steps = [
       { uses = checkout, with = { persist-credentials = false } },
       { share = { name = a.skills.name, path = a.skills.path } },

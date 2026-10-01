@@ -328,6 +328,12 @@ const vars = {
   RUNNER_TOOL_CACHE: CONFIG.toolcache,
   RUNNER_OS: "Linux",
   RUNNER_ARCH,
+  // The egress proxy, in every spelling tools read; Node's own fetch
+  // reads it only with NODE_USE_ENV_PROXY.
+  ...(CONFIG.proxy ? {
+    http_proxy: CONFIG.proxy, https_proxy: CONFIG.proxy, HTTP_PROXY: CONFIG.proxy, HTTPS_PROXY: CONFIG.proxy,
+    no_proxy: "localhost,127.0.0.1,::1", NO_PROXY: "localhost,127.0.0.1,::1", NODE_USE_ENV_PROXY: "1",
+  } : {}),
   ...(action ? { GITHUB_ACTION_PATH: action.dir, GITHUB_ACTION_REPOSITORY: action.repository, GITHUB_ACTION_REF: action.ref } : {}),
   ...Object.fromEntries(Object.entries(FILES).map(([f, name]) => [name, path.join(outDir, f)])),
 };

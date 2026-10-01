@@ -14,6 +14,8 @@ gha.compile {
     sandbox.user = "runner-sandbox",
     # What git tracks, plus what a runner step generates below.
     handoff.include = ["generated"],
+    # Egress for the sandbox: this host only, through the proxy (#22).
+    sandbox.network.allow = ["api.github.com"],
     runner_steps = [
       { uses = checkout, with = { persist-credentials = false } },
       {
@@ -21,6 +23,8 @@ gha.compile {
         shell = "bash",
         run = import "sandbox-test/install-tool.sh" as 'Text,
       },
+      # The sandbox's egress policy leaves runner's alone.
+      { name = "runner_steps reach any host", run = "curl -sSf --max-time 20 -o /dev/null https://example.com/" },
       # Shares, read-only to the sandbox: content, a file, a directory.
       { share = { name = "greeting", content = "hello from ${{ github.job }}" } },
       { share = { name = "LICENSE", path = "LICENSE" } },
@@ -222,9 +226,11 @@ gha.compile {
           mkdir -p ~/private && echo secret-ish >~/private/notes
         "%,
       },
+      { name = "Gets out only to allowed hosts", run = import "sandbox-test/egress.sh" as 'Text },
       { stage = { name = "report", path = "report.txt" } },
     ],
     publish_steps = [
+      { name = "publish_steps reach any host", run = "curl -sSf --max-time 20 -o /dev/null https://example.com/" },
       {
         name = "Read the staged report, as runner",
         id = "read-report",

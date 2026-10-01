@@ -33,6 +33,7 @@ fn config() -> Value {
         "lockRunnerSudo": true,
         "handoff": { "workspace": "tracked", "include": [".git"] },
         "workspace": "${{ github.workspace }}",
+        "network": { "allow": ["api.github.com", "*.githubusercontent.com"], "unrestricted": false },
     })
 }
 
@@ -79,13 +80,14 @@ impl Workflow {
             "RUNNER_SANDBOX_HANDOFF_JS": rt("handoff.cjs"),
             "RUNNER_SANDBOX_FILECMD_JS": rt("filecmd.cjs"),
             "RUNNER_SANDBOX_LAUNCH_JS": rt("launch.cjs"),
+            "RUNNER_SANDBOX_EGRESS_JS": rt("egress-proxy.cjs"),
         });
         let mut steps = vec![
             json!({ "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", "with": { "persist-credentials": false } }),
             json!({ "name": "Secure the host (generated)", "shell": "sudo node {0}", "run": rt("secure-host.cjs") }),
             json!({
                 "name": "Enter the sandbox (generated)",
-                "shell": "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}",
+                "shell": "sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS,RUNNER_SANDBOX_EGRESS_JS node {0}",
                 "env": env,
                 "run": format!("const CONFIG = {};\n{}", self.config, rt("install.cjs")),
             }),
@@ -415,6 +417,12 @@ fn finds_configs_other_than_the_compilers() {
             vec![],
         ),
         ("an extra key", json!({ "extra": 1 }), "CONFIG keys", vec![]),
+        (
+            "no network policy",
+            json!({ "network": null }),
+            "network policy",
+            vec![],
+        ),
     ];
     for (name, change, want, publish) in cases {
         let w = Workflow {
@@ -424,6 +432,73 @@ fn finds_configs_other_than_the_compilers() {
         };
         let found = problems(w).join("\n");
         assert!(found.contains(want), "{name}: {found}");
+    }
+}
+
+/// `sandbox.network` as gha.ncl's Network contract and the proxy read it.
+#[test]
+fn checks_the_network_policy() {
+    let cases = [
+        (json!({ "allow": [], "unrestricted": false }), true),
+        (json!({ "allow": [], "unrestricted": true }), true),
+        (
+            json!({ "allow": ["crates.io", "*.crates.io", "static.crates.io"], "unrestricted": false }),
+            true,
+        ),
+        (
+            json!({ "allow": ["crates.io"], "unrestricted": true }),
+            false,
+        ),
+        (
+            json!({ "allow": ["1.2.3.4"], "unrestricted": false }),
+            false,
+        ),
+        (json!({ "allow": ["[::1]"], "unrestricted": false }), false),
+        (json!({ "allow": ["*"], "unrestricted": false }), false),
+        (json!({ "allow": ["*.com"], "unrestricted": false }), false),
+        (
+            json!({ "allow": ["a.*.com"], "unrestricted": false }),
+            false,
+        ),
+        (
+            json!({ "allow": ["localhost"], "unrestricted": false }),
+            false,
+        ),
+        (
+            json!({ "allow": ["Crates.io"], "unrestricted": false }),
+            false,
+        ),
+        (
+            json!({ "allow": ["crates.io:443"], "unrestricted": false }),
+            false,
+        ),
+        (
+            json!({ "allow": ["https://crates.io"], "unrestricted": false }),
+            false,
+        ),
+        (
+            json!({ "allow": ["crates.io."], "unrestricted": false }),
+            false,
+        ),
+        (json!({ "allow": [1], "unrestricted": false }), false),
+        (
+            json!({ "allow": "crates.io", "unrestricted": false }),
+            false,
+        ),
+        (json!({ "allow": [] }), false),
+        (json!({ "allow": [], "unrestricted": "no" }), false),
+        (
+            json!({ "allow": [], "unrestricted": false, "dns": true }),
+            false,
+        ),
+    ];
+    for (network, ok) in cases {
+        let found = problems(with_config(with(
+            config(),
+            json!({ "network": network.clone() }),
+        )));
+        let flagged = found.iter().any(|p| p.contains("network policy"));
+        assert_eq!(flagged, !ok, "{network}: {found:?}");
     }
 }
 

@@ -18,6 +18,9 @@ gha.compile {
   permissions = { contents = "read" },
   jobs.actions = {
     "timeout-minutes" = 15,
+    # setup-node downloads Node from nodejs.org and its version list from
+    # GitHub; typos its binary from a GitHub release.
+    sandbox.network.allow = ["nodejs.org", "github.com", "api.github.com", "*.githubusercontent.com"],
     runner_steps = [
       { uses = checkout, with = { persist-credentials = false } },
     ],

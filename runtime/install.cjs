@@ -4,7 +4,8 @@
 // wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, the
 // workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS, and the
 // file command parser and step launcher they use as
-// RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS.
+// RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS, and the egress
+// proxy as RUNNER_SANDBOX_EGRESS_JS.
 //
 // It creates the sandbox user, hands it the workspace, installs
 // the two halves of the step wrapper, and (with CONFIG.lockRunnerSudo) takes
@@ -25,6 +26,19 @@ const TOOLCACHE = "/var/lib/runner-sandbox/toolcache";
 const FILECMD = "/usr/local/libexec/runner-sandbox-filecmd.cjs";
 const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
 const DOCKER_UNITS = ["docker.socket", "docker.service", "containerd.service"];
+// The egress proxy (egress-proxy.cjs), the sandbox's only way out unless
+// sandbox.network.unrestricted.
+const EGRESS_PROXY = "/usr/local/libexec/runner-sandbox-egress-proxy.cjs";
+const EGRESS_CONFIG = `${CONFIG_DIR}/egress.json`;
+const EGRESS_UNIT = "runner-sandbox-egress";
+const EGRESS_HOST = "127.0.0.1";
+const EGRESS_PORT = 3128;
+const NFT_TABLE = "runner_sandbox_egress";
+// systemd-resolved answers any local user over D-Bus and varlink, which no
+// packet filter sees: a way to send names (data) to any DNS server.
+const RESOLVED_BUS_NAME = "org.freedesktop.resolve1";
+const RESOLVED_VARLINK = "/run/systemd/resolve/io.systemd.Resolve";
+const DBUS_POLICY = "/etc/dbus-1/system.d/zz-runner-sandbox.conf";
 
 function run(cmd, args, { check = true } = {}) {
   const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
@@ -92,7 +106,85 @@ for (const d of [TEMPDIR, TOOLCACHE]) {
   fs.chownSync(d, sandbox.uid, sandbox.gid);
 }
 
-fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome }), { mode: 0o644 });
+// The sandbox's uid and its subordinate uids (rootless containers), as
+// nftables ranges.
+function sandboxUids() {
+  const ranges = [`${sandbox.uid}`];
+  const subuid = fs.existsSync("/etc/subuid") ? fs.readFileSync("/etc/subuid", "utf8") : "";
+  for (const line of subuid.split("\n")) {
+    const [owner, start, count] = line.trim().split(":");
+    if ((owner === user || owner === `${sandbox.uid}`) && Number(count) > 0) {
+      ranges.push(`${Number(start)}-${Number(start) + Number(count) - 1}`);
+    }
+  }
+  return ranges;
+}
+
+// Whether `user` (root if null) can open a TCP connection to host:port.
+function canConnect(host, port, asUser = null) {
+  const probe = ["bash", "-c", 'exec 3<>"/dev/tcp/$0/$1"', host, `${port}`];
+  const cmd = asUser ? ["runuser", "-u", asUser, "--", "timeout", "10", ...probe] : ["timeout", "10", ...probe];
+  return spawnSync(cmd[0], cmd.slice(1), { stdio: "ignore" }).status === 0;
+}
+
+// Default deny for the sandbox user: its packets may go to this host
+// (where the proxy listens), never to DNS, and nowhere else; the proxy,
+// another user, goes out for it to the allowed hosts only. The runner and
+// root keep their network as it was.
+function restrictEgress(allow) {
+  for (const tool of ["nft", "systemd-run"]) {
+    if (run("sh", ["-c", `command -v ${tool}`], { check: false }).status !== 0) {
+      throw new Error(`${tool} not found: sandbox.network needs it (or set sandbox.network.unrestricted = true)`);
+    }
+  }
+  if (canConnect(EGRESS_HOST, EGRESS_PORT)) throw new Error(`${EGRESS_HOST}:${EGRESS_PORT}, the egress proxy's port, is already taken`);
+  fs.writeFileSync(EGRESS_PROXY, process.env.RUNNER_SANDBOX_EGRESS_JS ?? "", { mode: 0o644 });
+  fs.writeFileSync(EGRESS_CONFIG, JSON.stringify({ listen: { host: EGRESS_HOST, port: EGRESS_PORT }, allow }), { mode: 0o644 });
+  run("systemd-run", [`--unit=${EGRESS_UNIT}`, "--property=DynamicUser=yes", "--property=ProtectSystem=strict",
+    "--property=ProtectHome=yes", "--property=PrivateTmp=yes", "--property=NoNewPrivileges=yes",
+    fs.realpathSync(process.execPath), EGRESS_PROXY, EGRESS_CONFIG]);
+  for (let i = 0; !canConnect(EGRESS_HOST, EGRESS_PORT); i++) {
+    if (i >= 50) throw new Error(`the egress proxy didn't start listening; see journalctl -u ${EGRESS_UNIT}`);
+    spawnSync("sleep", ["0.2"]);
+  }
+  const ruleset = `table inet ${NFT_TABLE} {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid { ${sandboxUids().join(", ")} } jump sandbox
+  }
+  chain sandbox {
+    meta l4proto { tcp, udp } th dport 53 counter reject
+    oif "lo" accept
+    meta l4proto tcp counter reject with tcp reset
+    counter reject with icmpx admin-prohibited
+  }
+}
+`;
+  const nft = spawnSync("nft", ["-f", "-"], { input: ruleset, encoding: "utf8", stdio: ["pipe", "inherit", "inherit"] });
+  if (nft.status !== 0) throw new Error(`nft -f failed (exit ${nft.status}) on:\n${ruleset}`);
+  if (fs.existsSync(path.dirname(DBUS_POLICY))) {
+    fs.writeFileSync(DBUS_POLICY, `<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="${user}">
+    <deny send_destination="${RESOLVED_BUS_NAME}"/>
+  </policy>
+</busconfig>
+`, { mode: 0o644 });
+    run("busctl", ["call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReloadConfig"]);
+  }
+  if (fs.existsSync(RESOLVED_VARLINK)) run("setfacl", ["-m", `u:${user}:---`, RESOLVED_VARLINK]);
+  // Fail closed: the sandbox must not get out on its own.
+  for (const [host, port] of [["1.1.1.1", 443], ["8.8.8.8", 53]]) {
+    if (canConnect(host, port, user)) throw new Error(`${user} still reaches ${host}:${port} directly after the egress rules`);
+  }
+  console.log(`Restricted ${user}'s egress to the proxy at ${EGRESS_HOST}:${EGRESS_PORT}, allowing ${allow.length ? allow.join(", ") : "nothing"}`);
+  return `http://${EGRESS_HOST}:${EGRESS_PORT}`;
+}
+const proxy = CONFIG.network.unrestricted ? null : restrictEgress(CONFIG.network.allow);
+if (!proxy) console.log(`sandbox.network.unrestricted: ${user}'s egress is open`);
+
+fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome, proxy }), { mode: 0o644 });
 // runner-sandbox-run runs as root under this node, through the one sudo
 // rule runner keeps, so the binary and every directory above it must be
 // root's alone: a runner-owned node, as in a tool cache, would give runner
