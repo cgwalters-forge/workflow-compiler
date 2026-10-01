@@ -65,6 +65,25 @@ test("neutralizes workflow commands but annotations", () => {
   for (const [line, want] of cases) assert.equal(neutralize(line), want, line);
 });
 
+test("with annotations off, only text commands pass", () => {
+  const { neutralize, allowedCommands, CommandFilter } = require("../../runtime/filecmd.cjs");
+  const allowed = allowedCommands(false);
+  const cases = [
+    ["::warning title=x::bad", "[sandbox] ::warning title=x::bad"],
+    [" ::ERROR::bad", " [sandbox] ::ERROR::bad"],
+    ["::notice::fyi", "[sandbox] ::notice::fyi"],
+    ["::debug::details", "::debug::details"],
+    ["::group::title", "::group::title"],
+    ["::endgroup::", "::endgroup::"],
+    ["::add-mask::secret", "[sandbox] ::add-mask::secret"],
+    ["text ##[warning]x", "text ## [warning]x"],
+  ];
+  for (const [line, want] of cases) assert.equal(neutralize(line, true, allowed), want, line);
+  const f = new CommandFilter({ annotations: false });
+  assert.equal(f.push("a\n::warn") + f.push("ing::x\n") + f.end(), "a\n[sandbox] ::warning::x\n");
+  assert.equal(new CommandFilter().push("::warning::x\n"), "::warning::x\n");
+});
+
 test("the filter follows the runner's line breaks across chunks", () => {
   const { CommandFilter } = require("../../runtime/filecmd.cjs");
   const run = (chunks) => {

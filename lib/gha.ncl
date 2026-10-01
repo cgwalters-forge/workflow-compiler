@@ -258,6 +258,11 @@ let SandboxStep = std.contract.Sequence [
     env | { _ : NoCredentials } | SafeEnvNames | optional,
     "continue-on-error" | Bool | optional,
     "timeout-minutes" | Number | optional,
+    # false: the step's output may not make annotations either, only show
+    # text (runtime/filecmd.cjs). For output a prompt can steer, such as
+    # an agent's, where an annotation would put its text on the run and
+    # on pull requests' checks.
+    annotations | Bool | optional,
   },
   OneOfRunUses,
 ] in
@@ -927,13 +932,22 @@ let sandbox_step = fun step =>
   if std.record.has_field "run" step then
     let env = if std.record.has_field "env" step then step.env else {} in
     let env_names = std.record.fields env in
-    let step = step |> std.record.insert "shell" "%{EXEC} {0}" in
-    if env_names == [] then
+    # Not in RUNNER_SANDBOX_ENV: the wrapper's runner side reads it, and
+    # the sandbox never sees it.
+    let wrapper_env =
+      if std.record.has_field "annotations" step && !step.annotations then
+        { RUNNER_SANDBOX_ANNOTATIONS = "0" }
+      else
+        {}
+    in
+    let env = if env_names == [] then env else std.record.insert "RUNNER_SANDBOX_ENV" (std.string.join "," env_names) env in
+    let env = env & wrapper_env in
+    let step =
       step
-    else
-      step
-      |> std.record.remove "env"
-      |> std.record.insert "env" (std.record.insert "RUNNER_SANDBOX_ENV" (std.string.join "," env_names) env)
+      |> std.record.filter (fun name _v => name != "env" && name != "annotations")
+      |> std.record.insert "shell" "%{EXEC} {0}"
+    in
+    if env == {} then step else std.record.insert "env" env step
   else
     step
 in
@@ -1018,7 +1032,9 @@ let compile_job = fun job =>
           { main = [stage_step "upload" (s | UploadStep)], post = [], fetch = [] }
         else
           let s = s | SandboxStep in
-          if std.record.has_field "uses" s then
+          if std.record.has_field "uses" s && std.record.has_field "annotations" s then
+            std.fail_with "`annotations` applies to `run` steps only"
+          else if std.record.has_field "uses" s then
             action_steps (if std.record.has_field "id" s then s.id else "action-%{std.to_string i}") s
           else
             { main = [sandbox_step s], post = [], fetch = [] })

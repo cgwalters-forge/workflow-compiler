@@ -146,6 +146,8 @@ fun args =>
           HARNESS_SHARE = harness_share,
         },
         run = "node %{gha.share_dir}/%{AGENT_RUN}",
+        # The agent's output is the prompt's to steer: no annotations (#60).
+        annotations = false,
       },
       { "if" = "always()", upload = { name = "agent-run", path = "agent-run" } },
       { "if" = "always()", upload = { name = "agent-transcript", path = "agent-transcript" } },

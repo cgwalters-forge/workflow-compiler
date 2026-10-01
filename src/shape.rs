@@ -155,7 +155,7 @@ static DENIED_ENV: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 static WRAPPER_ENV: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^RUNNER_SANDBOX_(ENV|ENV_NAMES|VAR_[0-9]+)$"));
+    LazyLock::new(|| re(r"^RUNNER_SANDBOX_(ENV|ENV_NAMES|VAR_[0-9]+|ANNOTATIONS)$"));
 /// As USER_RE in lib/gha.ncl.
 static USER: LazyLock<Regex> = LazyLock::new(|| re(r"^[a-z_][a-z0-9_-]{0,30}$"));
 static WORKSPACE_PATH: LazyLock<Regex> = LazyLock::new(|| re(r"^[^/]+(/[^/]+)*$"));

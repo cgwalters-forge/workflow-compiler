@@ -24,7 +24,7 @@
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
-const { parse, format, neutralize } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
+const { parse, format, neutralize, allowedCommands } = require("/usr/local/libexec/runner-sandbox-filecmd.cjs");
 
 const RUN = "/usr/local/libexec/runner-sandbox-run";
 const SUDO = "/usr/bin/sudo";
@@ -35,10 +35,15 @@ const CONTEXT_ENV = [
 ];
 const USAGE = "usage: runner-sandbox-exec SCRIPT | --action SPEC | --action-path USES SCRIPT | --stage NAME PATH | --seal";
 
+// Set to 0 by the compiler for a step whose output may hold no
+// annotations (filecmd.cjs), such as an agent's.
+const annotations = process.env.RUNNER_SANDBOX_ANNOTATIONS !== "0";
+
 // MESSAGE can quote what the sandbox wrote, so its lines go through the
 // same filter as the sandbox's own output.
 function fail(message) {
-  console.error(String(message).split(/\r\n|\r|\n/).map((l) => neutralize(`runner-sandbox-exec: ${l}`)).join("\n"));
+  const allowed = allowedCommands(annotations);
+  console.error(String(message).split(/\r\n|\r|\n/).map((l) => neutralize(`runner-sandbox-exec: ${l}`, true, allowed)).join("\n"));
   process.exit(125);
 }
 
@@ -82,6 +87,7 @@ switch (args[0]) {
   default:
     request = { id, script: fs.readFileSync(args[0], "utf8"), env };
 }
+request.annotations = annotations;
 // By absolute path: the step's own env: applies to this process.
 const r = spawnSync(SUDO, ["-n", RUN], { input: JSON.stringify(request), stdio: ["pipe", "inherit", "inherit"] });
 if (r.error) fail(`running ${RUN}: ${r.error.message}`);

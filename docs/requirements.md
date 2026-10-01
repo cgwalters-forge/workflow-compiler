@@ -398,7 +398,9 @@ step summary, and staged outputs, each read without following symlinks and
 with a size cap, after every process of the step is gone. Its standard
 output and error go to the job's log with every workflow command
 neutralized except annotations (`warning`, `error`, `notice`) and
-`debug` and log groups, which only show text. One channel is not validated, and everything
+`debug` and log groups, which only show text. A step can turn the annotations off
+too (`annotations = false`), and `agent_run`'s agent step does: its output
+is the agent's, which a prompt can steer. One channel is not validated, and everything
 downstream must treat it as untrusted: the step's exit status, which
 decides its outcome and whether later `success()` steps run.
 
