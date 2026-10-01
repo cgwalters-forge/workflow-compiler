@@ -199,7 +199,9 @@ step. That takes a few minutes, but it needs no release infrastructure. It
 isn't a shimmed action, because it isn't one. The better form is a release
 artifact pinned by sha256, which the compiler would download and check,
 once that repository publishes one. Only the scripted `fake` agent runs
-for now. How real inference plugs in (praxis run tokens, registered in the
+for now; `fake_script` appends a source's own actions to its session
+(say, execute, read, write), to stand in for a model's work in a demo or
+a test. How real inference plugs in (praxis run tokens, registered in the
 privileged phase, handed to the sandbox alone, ended in the publish phase)
 is [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36).
 
