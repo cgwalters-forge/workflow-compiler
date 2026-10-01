@@ -44,7 +44,7 @@ let HARNESS_GRACE_MINUTES = 3 in
 # `ESCAPED-<name>` if it didn't, which ci reads from the transcript (the
 # quotes keep the markers out of the command's own text there). They
 # are the checks the old stub agent made, run by the agent itself.
-let session = fun prompt =>
+let session = fun prompt extra =>
   let attempt = fun name cmd => { execute = { title = "Bash", command = "(%{cmd}) >/dev/null 2>&1 && echo ESC''APED-%{name} || echo contain''ed-%{name}" } } in
   [
     { say = "Fake run: the tools, the sandbox, the permission policy, the redaction pass, and escape attempts." },
@@ -60,6 +60,9 @@ let session = fun prompt =>
     attempt "job-token" "env | grep -E '^(ACTIONS_(RUNTIME|ID_TOKEN_REQUEST)_|GITHUB_TOKEN=)'",
     { write = { title = "Write", path = "{cwd}/FAKE.md", content = "Written by a fake agent run.\n" } },
     { write = { title = "Write", path = "{home}/out/outcome.json", content = "{\"tests\": [{\"command\": \"git log --oneline -1\", \"exit_code\": 0, \"duration_s\": 0}]}\n" } },
+  ]
+  @ extra
+  @ [
     { cost = { usd = 0.01 } },
     { say = "Done: the fake run finished." },
   ]
@@ -82,6 +85,11 @@ let AgentRun = {
   # An entry in bot-harness's agents.toml; only the scripted one until
   # there is inference.
   agent | [| 'fake |] | default = 'fake,
+  # More actions for the scripted agent, after the demo and the escape
+  # attempts: a stand-in for a real agent's work in a demo or a test,
+  # such as writing the outputs a later job consumes. Each is a step of
+  # fake-acp-agent's script (say, execute, read, write).
+  fake_script | Array { _ : Dyn } | default = [],
   # Minutes the agent may run, and its spend cap in AIC (1 AIC = $0.01).
   agent_timeout_minutes | Number | default = 10,
   budget_aic | Number | default = 500,
@@ -102,7 +110,7 @@ fun args =>
       { share = { name = a.skills.name, path = a.skills.path } },
       { share = { name = AGENT_RUN, content = import "../runtime/agent-run.cjs" as 'Text } },
       { share = { name = AGENT_POLICY, content = import "../runtime/agent-policy.toml" as 'Text } },
-      { share = { name = AGENT_SESSION, content = std.serialize 'Json (session a.prompt) } },
+      { share = { name = AGENT_SESSION, content = std.serialize 'Json (session a.prompt a.fake_script) } },
       {
         share = {
           name = AGENT_REGISTRY,
