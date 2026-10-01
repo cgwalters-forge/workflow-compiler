@@ -186,7 +186,10 @@ untrusted as anything else from the sandbox. What bounds a hostile agent
 is the sandbox: the step's `timeout-minutes`, the agent's timeout plus a
 few minutes' grace, after which the wrapper stops every process of the
 step, and the uid boundary. Spend caps will be praxis's, not the
-harness's (#36). The scripted agent also tries the escapes the old stub
+harness's (#36). The agent's step makes no annotations either
+(`annotations = false`, which any `run` step can set): its output is the
+agent's, which a prompt can steer, and an annotation would put it on the
+run and on pull requests' checks. The scripted agent also tries the escapes the old stub
 checked for: rewriting its prompt, adding to a share, sudo, reading
 `Runner.Worker`'s environment or the runner's home, and seeing the job's
 tokens. `ci` requires every one to have failed, from the transcript.

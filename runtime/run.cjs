@@ -131,6 +131,7 @@ try {
   fail(`invalid request: ${e.message}`);
 }
 if (!/^[0-9a-f]{32}$/.test(req.id ?? "")) fail("invalid step id");
+if (req.annotations !== undefined && typeof req.annotations !== "boolean") fail("invalid annotations");
 if (typeof req.script !== "string" && typeof req.action !== "object" && typeof req.stage !== "object" && req.seal !== true) fail("missing script");
 const env = req.env ?? {};
 // The environment reaches the step through a file (see LAUNCHER), so
@@ -368,7 +369,7 @@ function runFiltered(args) {
     const child = spawn("run0", args, { stdio: ["pipe", "pipe", "pipe"] });
     child.stdin.end();
     for (const [from, to] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
-      const filter = new CommandFilter();
+      const filter = new CommandFilter({ annotations: req.annotations !== false });
       from.on("data", (chunk) => to.write(filter.push(chunk)));
       from.on("end", () => to.write(filter.end()));
     }

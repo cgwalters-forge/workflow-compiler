@@ -21,7 +21,10 @@
 // the sandbox's, so CommandFilter neutralizes every command in it except
 // the annotations linters report with (`warning`, `error`, `notice`),
 // `debug`, and `group`/`endgroup`, which fold the log: they only show
-// text. The others would set outputs or state
+// text. A step whose output isn't a linter's but an agent's, which a
+// prompt can steer, gets no annotations either (`annotations: false`):
+// they would put its text on the run and on pull requests' checks. The
+// others would set outputs or state
 // behind the file commands' checks (`set-output`, `save-state`), change
 // the runner's environment, PATH or problem matchers, mask text in later
 // steps' logs, or stop command processing for the steps after it.
@@ -74,7 +77,12 @@ function format(name, value) {
   return `${name}<<${delimiter}\n${value}\n${delimiter}\n`;
 }
 
-const ALLOWED_COMMANDS = new Set(["warning", "error", "notice", "debug", "group", "endgroup"]);
+const TEXT_COMMANDS = ["debug", "group", "endgroup"];
+const ANNOTATIONS = ["warning", "error", "notice"];
+const ALLOWED_COMMANDS = new Set([...ANNOTATIONS, ...TEXT_COMMANDS]);
+const ALLOWED_NO_ANNOTATIONS = new Set(TEXT_COMMANDS);
+// The commands a step's output may use.
+const allowedCommands = (annotations) => (annotations ? ALLOWED_COMMANDS : ALLOWED_NO_ANNOTATIONS);
 const LEGACY_PREFIX = "##[";
 const NEUTRALIZED_LEGACY = "## [";
 const MARK = "[sandbox] ";
@@ -83,21 +91,23 @@ const MAX_HELD = 64 * 1024;
 
 // LINE, one line of a sandboxed step's output, with its commands
 // neutralized. AT_START is false for the rest of a line whose start was
-// already passed on.
-function neutralize(line, atStart = true) {
+// already passed on. ALLOWED is the set of commands left as they are.
+function neutralize(line, atStart = true, allowed = ALLOWED_COMMANDS) {
   const out = line.replaceAll(LEGACY_PREFIX, NEUTRALIZED_LEGACY);
   if (!atStart) return out;
   // The runner trims what .NET calls whitespace, which includes U+0085.
   const m = /^([\s\u0085]*)::([^\s\u0085:]*)/.exec(out);
-  if (!m || ALLOWED_COMMANDS.has(m[2].toLowerCase())) return out;
+  if (!m || allowed.has(m[2].toLowerCase())) return out;
   return `${m[1]}${MARK}${out.slice(m[1].length)}`;
 }
 
 // Filters a stream of a sandboxed step's output: push() chunks as they
 // come, and end() at the end; both return what to pass on. Lines end
-// where the runner's reader ends them, at \n, \r or \r\n.
+// where the runner's reader ends them, at \n, \r or \r\n. ANNOTATIONS
+// false neutralizes annotations too.
 class CommandFilter {
-  constructor() {
+  constructor({ annotations = true } = {}) {
+    this.allowed = allowedCommands(annotations);
     this.decoder = new StringDecoder("utf8");
     this.held = "";
     this.atStart = true;
@@ -110,14 +120,14 @@ class CommandFilter {
       const m = /\r\n|\r|\n/.exec(this.held);
       // A \r at the end may be the start of \r\n.
       if (!m || (m[0] === "\r" && m.index === this.held.length - 1)) break;
-      out += neutralize(this.held.slice(0, m.index), this.atStart) + m[0];
+      out += neutralize(this.held.slice(0, m.index), this.atStart, this.allowed) + m[0];
       this.held = this.held.slice(m.index + m[0].length);
       this.atStart = true;
     }
     if (this.held.length > MAX_HELD) {
       // Keep the last two characters: they may begin a "##[".
       const keep = this.held.slice(-2);
-      out += neutralize(this.held.slice(0, -2), this.atStart);
+      out += neutralize(this.held.slice(0, -2), this.atStart, this.allowed);
       this.held = keep;
       this.atStart = false;
     }
@@ -127,8 +137,8 @@ class CommandFilter {
   end() {
     const rest = this.held + this.decoder.end();
     this.held = "";
-    return rest === "" ? "" : neutralize(rest, this.atStart);
+    return rest === "" ? "" : neutralize(rest, this.atStart, this.allowed);
   }
 }
 
-module.exports = { parse, format, NAME_RE, neutralize, CommandFilter };
+module.exports = { parse, format, NAME_RE, neutralize, allowedCommands, CommandFilter };
