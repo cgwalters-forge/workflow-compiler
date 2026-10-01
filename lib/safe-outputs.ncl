@@ -19,7 +19,9 @@
 # its text again (mentions, HTML comments, workflow commands), and only
 # then writes (runtime/safe-outputs-apply.cjs).
 #
-# Types: add_comment on listed issues, and noop.
+# Types: add_comment on listed issues, noop, and
+# create_pull_request (a `git diff` the job applies to a fresh fetch of
+# `base`, pushes as a new branch and opens as a pull request).
 let gha = import "gha.ncl" in
 let download = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" in # v8.0.1
 let ARTIFACT = "safe-outputs" in
@@ -34,6 +36,13 @@ let VALIDATED = "safe-outputs-validated" in
 
 let Positive = std.contract.from_predicate (fun n => std.is_number n && n >= 1 && std.number.is_integer n) in
 let Repo = std.contract.from_predicate (fun s => std.is_string s && std.string.is_match "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" s) in
+# A branch name, or with a trailing / a prefix of one.
+let branch = fun prefix => std.contract.from_predicate (fun s =>
+  std.is_string s
+  && std.string.is_match "^[A-Za-z0-9][A-Za-z0-9._/-]*$" s
+  && !(std.string.is_match "\\.\\.|//|\\.lock(/|$)" s)
+  && (prefix || !(std.string.is_match "/$" s)))
+in
 
 let SafeOutputs = {
   # The agent job, whose `upload` step handed out the proposals.
@@ -51,6 +60,19 @@ let SafeOutputs = {
       targets | Array Positive,
       max_body_bytes | Positive | default = 16384,
     } | optional,
+    create_pull_request | {
+      max | Positive | default = 1,
+      # The branch the patch applies to and the pull request targets.
+      base | branch false,
+      # Globs (`*` within a directory, `**` across) of the paths a patch
+      # may change. `.github/`, `.git` and `.gitmodules` never.
+      allowed_paths | Array String,
+      max_patch_bytes | Positive | default = 65536,
+      max_files | Positive | default = 20,
+      max_body_bytes | Positive | default = 16384,
+      branch_prefix | branch true | default = "safe-outputs/",
+      draft | Bool | default = true,
+    } | optional,
     noop | { max | Positive | default = 1 } | optional,
   },
   "runs-on" | String | default = gha.default_runner,
@@ -59,7 +81,8 @@ let SafeOutputs = {
 
 # The job token's permissions: only what the enabled types write with.
 let permissions_for = fun types =>
-  if std.record.has_field "add_comment" types then { issues = "write" } else {}
+  (if std.record.has_field "add_comment" types then { issues = "write" } else {})
+  & (if std.record.has_field "create_pull_request" types then { contents = "write", "pull-requests" = "write" } else {})
 in
 
 {
