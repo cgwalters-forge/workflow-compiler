@@ -208,6 +208,19 @@ a test. How real inference plugs in (praxis run tokens, registered in the
 privileged phase, handed to the sandbox alone, ended in the publish phase)
 is [#36](https://github.com/cgwalters-forge/workflow-compiler/issues/36).
 
+`lib/safe-outputs.ncl` builds the job that acts on what an agent
+proposed, the way gh-aw's safe outputs do. The agent, with no token,
+writes one JSON object per line to `safe-outputs/outputs.jsonl`
+(gh-aw's `type` and fields), handed out by `safe_outputs.upload`. The
+job from `safe_outputs.apply { needs, repo, types }` has a token with only
+the permissions its enabled types write with. It checks the proposals in
+its own sandbox against the source's types, targets and caps, and scans
+them for secrets (`runtime/safe-outputs-validate.cjs`). Then its publish
+phase checks what the sandbox accepted again, with the same code, and
+sanitizes its text again (mentions, HTML comments, workflow commands)
+before it writes anything (`runtime/safe-outputs-apply.cjs`). The types
+are `add_comment`, on the issues the source lists, and `noop`.
+
 `agent_run` is a compiler macro rather than a composite action because a
 composite action runs as `runner` and can't constrain the job around it
 ([#4](https://github.com/cgwalters-forge/workflow-compiler/issues/4)).
