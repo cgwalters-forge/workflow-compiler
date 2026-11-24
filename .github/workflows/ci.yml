@@ -4,6 +4,8 @@ name: ci
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
 
@@ -148,13 +150,13 @@ jobs:
   actions-test:
     uses: ./.github/workflows/actions-test.lock.yml
 
-  # Skipped when the run is cancelled: concurrency cancels a run that a
-  # newer one for the same ref supersedes (a stacked pull request's base
-  # and head pushed together start two), and a failing ci there would show
-  # on a head whose newer run passed. GitHub counts a skipped required job
-  # as passed, so a run cancelled by hand needs a rerun before merging.
+  # Runs even when the run is cancelled, and then fails: GitHub counts a
+  # skipped required job as passed, so a skipped ci would let a pull
+  # request or merge group whose checks never finished merge. A run that
+  # concurrency cancels for a newer one on the same ref therefore fails
+  # too; rerun the newer one if its ci finished first.
   ci:
-    if: ${{ !cancelled() }}
+    if: ${{ always() }}
     needs: [lint, compile, zizmor, sandbox-test, sandbox-test-artifacts, agent-review, agent-review-artifacts, actions-test]
     runs-on: ubuntu-26.04
     steps:
